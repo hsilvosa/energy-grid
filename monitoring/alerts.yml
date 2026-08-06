@@ -1,0 +1,31 @@
+groups:
+  - name: energy-grid
+    rules:
+      - alert: ForecastServiceLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(energy_api_request_duration_seconds_bucket[5m]))) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Forecast API p95 latency exceeds 250 ms
+      - alert: SourceDataStale
+        expr: energy_source_freshness_seconds > 1800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: An operational grid source is stale
+      - alert: ForecastErrorDegraded
+        expr: energy_forecast_error_ratio{horizon="rolling_7d"} > 1.2
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Forecast error crossed the rollback ratio
+      - alert: KafkaConsumerLag
+        expr: sum(kafka_consumergroup_lag) by (consumergroup) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kafka consumer lag is high

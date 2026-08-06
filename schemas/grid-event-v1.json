@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/energy-grid/grid-event-v1.json",
+  "title": "Canonical energy grid event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "event_id", "source", "event_type", "area",
+    "interval_start", "interval_end", "published_at", "ingested_at",
+    "value", "unit", "revision", "quality_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "event_id": {"type": "string", "format": "uuid"},
+    "source": {"type": "string", "minLength": 1},
+    "event_type": {"enum": ["demand", "generation", "price", "weather"]},
+    "area": {"type": "string", "minLength": 1},
+    "interval_start": {"type": "string", "format": "date-time"},
+    "interval_end": {"type": "string", "format": "date-time"},
+    "published_at": {"type": "string", "format": "date-time"},
+    "ingested_at": {"type": "string", "format": "date-time"},
+    "value": {"type": ["number", "null"]},
+    "unit": {"enum": ["MW", "EUR/MWh", "degC", "m/s", "%", "W/m2"]},
+    "revision": {"type": "integer", "minimum": 1},
+    "quality_status": {"enum": ["valid", "missing", "estimated", "invalid"]},
+    "dimension": {"type": ["string", "null"]},
+    "source_url": {"type": ["string", "null"]},
+    "request_params": {"type": "object"},
+    "payload_checksum": {"type": ["string", "null"]}
+  }
+}
+

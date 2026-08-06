@@ -1,0 +1,56 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "title": "Demand forecast",
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "energy-postgres"},
+      "targets": [{"format": "time_series", "rawSql": "SELECT valid_from AS time, point AS \"P50 demand\", p10 AS \"P10 demand\", p90 AS \"P90 demand\" FROM forecasts WHERE target='demand' AND is_shadow=false ORDER BY valid_from", "refId": "A"}],
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "title": "Day-ahead price forecast",
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "energy-postgres"},
+      "targets": [{"format": "time_series", "rawSql": "SELECT valid_from AS time, point AS \"P50 price\", p10 AS \"P10 price\", p90 AS \"P90 price\" FROM forecasts WHERE target='price' AND is_shadow=false ORDER BY valid_from", "refId": "A"}],
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "title": "API p95 latency",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(energy_api_request_duration_seconds_bucket[5m])))", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 9}
+    },
+    {
+      "title": "Kafka lag",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sum(kafka_consumergroup_lag) by (consumergroup)", "refId": "A"}],
+      "gridPos": {"h": 5, "w": 8, "x": 8, "y": 9}
+    },
+    {
+      "title": "Late and rejected events",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "sum(rate(energy_late_events_total[5m]))", "legendFormat": "late", "refId": "A"}, {"expr": "sum(rate(energy_dead_letter_events_total[5m]))", "legendFormat": "dead letter", "refId": "B"}],
+      "gridPos": {"h": 5, "w": 8, "x": 16, "y": 9}
+    },
+    {
+      "title": "Forecast error ratio and rollback",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"expr": "energy_forecast_error_ratio", "legendFormat": "{{target}} error ratio", "refId": "A"}, {"expr": "energy_model_rollback_state", "legendFormat": "{{target}} rollback", "refId": "B"}],
+      "gridPos": {"h": 5, "w": 12, "x": 0, "y": 14}
+    }
+  ],
+  "schemaVersion": 41,
+  "tags": ["energy", "forecasting", "operations"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now+24h"},
+  "title": "Energy Grid Intelligence",
+  "uid": "energy-grid-intelligence",
+  "version": 1
+}
