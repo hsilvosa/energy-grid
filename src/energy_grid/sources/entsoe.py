@@ -48,13 +48,21 @@ class EntsoeClient:
             "periodStart": start.astimezone(UTC).strftime("%Y%m%d%H%M"),
             "periodEnd": end.astimezone(UTC).strftime("%Y%m%d%H%M"),
         }
-        area_key = "in_Domain" if target == EventType.PRICE else "outBiddingZone_Domain"
-        params[area_key] = area
-        if target == EventType.GENERATION:
+        if target == EventType.PRICE:
+            params.update({"in_Domain": area, "out_Domain": area})
+        elif target == EventType.GENERATION:
             params = {**params, "in_Domain": area}
-            params.pop("outBiddingZone_Domain", None)
-        response = httpx.get(ENTSOE_ENDPOINT, params=params, timeout=self.timeout)
-        response.raise_for_status()
+        else:
+            params["outBiddingZone_Domain"] = area
+        try:
+            response = httpx.get(ENTSOE_ENDPOINT, params=params, timeout=self.timeout)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"ENTSO-E request failed with HTTP {exc.response.status_code}"
+            ) from None
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"ENTSO-E connection failed: {type(exc).__name__}") from None
         safe_params = {key: value for key, value in params.items() if key != "securityToken"}
         return response.content, safe_params
 
@@ -67,7 +75,12 @@ class EntsoeClient:
         area: str = AREA_ES,
     ) -> list[GridEvent]:
         payload, params = self.download(target, start, end, area=area)
-        return list(parse_entsoe_document(payload, target, area=area, request_params=params))
+        events = list(parse_entsoe_document(payload, target, area=area, request_params=params))
+        if not events:
+            root = ElementTree.fromstring(payload)
+            reason = _text(root, "text") or "response contained no time series"
+            raise RuntimeError(f"ENTSO-E returned no {target.value} events: {reason}")
+        return events
 
 
 def _text(element: ElementTree.Element, name: str) -> str | None:

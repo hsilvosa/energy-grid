@@ -97,7 +97,7 @@ The separate backfill job selects a bounded range from the late-event table and 
 
 ## 7. Feature construction and forecasting
 
-Feature construction uses publication-time as-of joins. A measurement is eligible only if it was published by the forecast origin. This prevents a model from seeing information that became available later, even when the measurement describes an earlier delivery interval.
+The repository contains publication-time as-of feature utilities and tests that demonstrate the required leakage rule. The simplified real-data training path currently aligns ENTSO-E targets and Open-Meteo historical forecast variables by valid timestamp. It does not yet reconstruct all source revisions exactly as they were available at every historical forecast origin. This distinction is recorded as a model limitation and must be resolved before production evaluation.
 
 The forecasting layer includes:
 
@@ -109,7 +109,7 @@ The forecasting layer includes:
 - A critical-slice guard preventing regressions greater than 10 percent.
 - A rollback controller requiring three consecutive error breaches above 120 percent of the reference error.
 
-MLflow registration stores model metrics, parameters, Git commit, feature schema hash, Iceberg snapshot, source versions, and training window. Registered candidates receive the `challenger` alias. Production rollback changes the `champion` alias to the previous accepted version.
+The intended MLflow registry flow stores model metrics, parameters, Git commit, feature schema hash, Iceberg snapshot, source versions, and training window. Registered candidates should receive the `challenger` alias, and production rollback should change the `champion` alias to the previous accepted version. The current real-data command logs metrics, lineage tags, and P10/P50/P90 model artifacts, but it does not yet register model versions or move registry aliases automatically.
 
 ## 8. Serving and monitoring
 
@@ -146,7 +146,7 @@ The sandbox user did not own the repository, so Git reported dubious ownership. 
 
 ### Python runtime mismatch
 
-The machine's default interpreter was Python 3.14, while the project targets Python 3.11–3.12 for Spark and scientific-library compatibility. Python 3.12 was available through the Windows application installation, but sandbox access initially prevented creation and execution of the virtual environment. The environment was created with the required permission and kept inside `.venv`.
+The machine's default interpreter was Python 3.14, while the project targets Python 3.11-3.12 for Spark and scientific-library compatibility. Python 3.12 was available through the Windows application installation, but sandbox access initially prevented creation and execution of the virtual environment. The environment was created with the required permission and kept inside `.venv`. Normal users do not need this environment because the recommended real-data path runs Python inside Docker.
 
 ### Dependency installation timeout
 
@@ -172,21 +172,45 @@ Observed weather can make historical model scores unrealistically good because t
 
 Running AWS Glue locally would make the demo unnecessarily difficult. The Spark configuration isolates the catalog choice: local execution uses the Hadoop catalog with MinIO, while AWS uses Glue with S3.
 
-### Verification tool availability
+### ENTSO-E day-ahead price requests
 
-The Docker Compose configuration was validated, but the complete container stack was not started during the implementation session. Terraform was not installed on the host, so provider-level validation could not run locally. The GitHub Actions workflow performs Terraform formatting, initialization without a backend, validation, and security scanning.
+The first real price request returned HTTP 400 even though the same token worked for demand. ENTSO-E's price endpoint requires both `in_Domain` and `out_Domain` for the Spanish bidding zone. Supplying both parameters fixed the request. HTTP error handling was also changed so a request URL containing the security token is never copied into an exception message.
+
+### Gaps in operational source series
+
+Real ENTSO-E documents do not always form the perfectly complete matrix produced by fixtures. After weekly lag creation and publication-time alignment, a 45-day request produced 756 eligible demand rows rather than the original hard-coded minimum of 768. The minimum was changed to five complete days after feature construction, while missing values remain explicit and carry quality metadata.
+
+### MLflow client and server compatibility
+
+The first container run reached ENTSO-E, Open-Meteo, Kafka, and PostgreSQL but failed while logging models. The application used MLflow 3.15.1 while the server image used 3.1.4, so their database expectations differed. Pinning both sides to 3.15.1 fixed the schema mismatch. MLflow 3.15 also rejects unknown HTTP Host headers by default; the local server now explicitly permits only `mlflow:5000`, localhost, and loopback hosts.
+
+### Optional Spark image defaults
+
+The Spark/Iceberg image starts several Spark services through an entrypoint and evaluates the submitted command as one shell argument. The Compose command therefore had to be supplied as one folded value. The image also defaults to a bundled REST catalog named `demo`; the application explicitly selects the local Hadoop catalog backed by MinIO. Kafka and S3 connector packages are declared on `spark-submit` because they are not included in the base runtime.
+
+This work made it clear that Spark, Kafka, and Iceberg add substantial local startup cost. They are now an optional `streaming` profile. The recommended real-data path uses PostgreSQL directly and keeps the distributed path for demonstrations that specifically need event-time and lakehouse behavior.
 
 ## 11. Verification completed
 
 The final local verification included:
 
-- 24 passing tests.
+- Real authenticated ENTSO-E demand, price, and generation downloads.
+- Real Open-Meteo historical and live forecast downloads.
+- 1,428 demand, 4,132 price, 758 generation, and 2,112 weather source events in the verified run.
+- 24 six-hour demand forecasts and 96 next-day price forecasts in PostgreSQL and FastAPI.
+- Demand validation MAE of 861.055 MW versus a 1,315.523 MW seasonal baseline.
+- Price validation MAE of 29.629 EUR/MWh versus a 57.918 EUR/MWh seasonal baseline.
+- Two MLflow runs containing P10, P50, and P90 LightGBM artifacts and source lineage.
+- Kafka publication of the real canonical events when the optional flag was enabled.
+- 29 passing tests after the real-data integration and Compose simplification.
 - Clean Ruff linting.
-- Strict mypy success across 19 source files.
+- Strict mypy success across the source package.
 - Valid JSON Schema and Grafana dashboard JSON.
 - Valid Docker Compose configuration.
-- A smoke run that materialized 24 demand forecasts and 96 ordinary-day price forecasts.
-- A three-window degradation simulation that changed demand model status to `rolled_back`.
+
+The exact forecast metrics change when the live data window changes. They are recorded here to distinguish a verified real run from the deterministic fixture demonstration, not as a stable model-performance claim.
+
+The short holdout results are not sufficient to call either model production-ready. Demand showed useful point-forecast performance but poor interval coverage. Price error and interval coverage remain weak. The full evaluation, interpretation, missing features, and promotion requirements are documented in [MODEL_CARD.md](MODEL_CARD.md).
 
 ## 12. Getting an ENTSO-E API token
 

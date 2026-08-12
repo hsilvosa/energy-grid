@@ -17,6 +17,9 @@ def build_spark() -> Any:
         .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.local.type", "hadoop")
         .config("spark.sql.catalog.local.warehouse", warehouse)
+        # The tabulario image defaults to its bundled `demo` REST catalog.
+        # Use the self-contained Hadoop catalog backed by MinIO instead.
+        .config("spark.sql.defaultCatalog", "local")
         .config("spark.hadoop.fs.s3a.endpoint", os.getenv("AWS_ENDPOINT_URL", "http://minio:9000"))
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config("spark.hadoop.fs.s3a.access.key", os.getenv("AWS_ACCESS_KEY_ID", "minio"))

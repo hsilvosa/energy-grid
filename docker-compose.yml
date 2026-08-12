@@ -9,10 +9,12 @@ x-app-env: &app-env
   AWS_ENDPOINT_URL: http://minio:9000
   MLFLOW_S3_ENDPOINT_URL: http://minio:9000
   ICEBERG_WAREHOUSE: s3a://energy-lakehouse/warehouse
+  ENTSOE_TOKEN: ${ENTSOE_TOKEN:-}
 
 services:
   kafka:
     image: apache/kafka:3.9.1
+    profiles: ["streaming"]
     hostname: kafka
     ports:
       - "29092:29092"
@@ -37,6 +39,7 @@ services:
 
   kafka-init:
     image: apache/kafka:3.9.1
+    profiles: ["streaming"]
     depends_on:
       kafka:
         condition: service_healthy
@@ -123,7 +126,11 @@ services:
 
   spark-streaming:
     image: tabulario/spark-iceberg:3.5.5_1.8.1
-    command: ["/opt/spark/bin/spark-submit", "--master", "local[2]", "/app/src/energy_grid/streaming.py"]
+    command:
+      - >-
+        /opt/spark/bin/spark-submit --master local[2]
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.apache.hadoop:hadoop-aws:3.3.4
+        /app/src/energy_grid/streaming.py
     environment:
       <<: *app-env
       PYTHONPATH: /app/src
@@ -140,6 +147,7 @@ services:
 
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.9.0
+    profiles: ["streaming"]
     command: ["--kafka.server=kafka:9092"]
     depends_on:
       kafka:
@@ -185,8 +193,18 @@ services:
         condition: service_started
     profiles: ["demo"]
 
+  live-demo:
+    build: .
+    command: ["python", "-m", "energy_grid.cli", "live-demo", "--no-publish-kafka"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    profiles: ["live"]
+
 volumes:
   minio-data:
   postgres-data:
   spark-checkpoints:
-

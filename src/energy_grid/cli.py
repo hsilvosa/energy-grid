@@ -11,6 +11,7 @@ import typer
 from energy_grid.config import get_settings
 from energy_grid.domain import EventType
 from energy_grid.forecasting import materialize_demo_forecasts
+from energy_grid.live_service import run_live_pipeline
 from energy_grid.monitoring import EVENTS_PUBLISHED
 from energy_grid.replay import KafkaProducerAdapter, ReplayProfile, load_fixture
 from energy_grid.replay import replay as replay_events
@@ -162,6 +163,40 @@ def demo(
         degraded = next(item.model_version for item in forecasts if item.target == target)
         _simulate_degradation(store, target, degraded)
     typer.echo(f"Demo complete: {count} events and {len(forecasts)} forecasts")
+
+
+@app.command("live-demo")
+def live_demo(
+    history_days: Annotated[int, typer.Option(min=15, max=365)] = 45,
+    generation_days: Annotated[int, typer.Option(min=1, max=30)] = 2,
+    publish_kafka: Annotated[bool, typer.Option()] = True,
+    register_mlflow: Annotated[bool, typer.Option()] = True,
+) -> None:
+    """Download real Spanish data, train models and materialize live forecasts."""
+    summary = run_live_pipeline(
+        get_settings(),
+        history_days=history_days,
+        generation_days=generation_days,
+        publish_kafka=publish_kafka,
+        register_mlflow=register_mlflow,
+    )
+    typer.echo(
+        "Real-data run complete: "
+        f"demand_events={summary.demand_events}, "
+        f"price_events={summary.price_events}, "
+        f"generation_events={summary.generation_events}, "
+        f"weather_events={summary.weather_events}, "
+        f"kafka_events={summary.kafka_events}"
+    )
+    for result in (summary.demand_result, summary.price_result):
+        typer.echo(
+            f"{result.target.value}: forecasts={len(result.forecasts)}, "
+            f"training_rows={result.training_rows}, "
+            f"mae={result.metrics.mae:.3f}, baseline_mae={result.baseline_mae:.3f}, "
+            f"snapshot={result.snapshot_id}"
+        )
+    if summary.mlflow_run_ids:
+        typer.echo(f"MLflow runs: {summary.mlflow_run_ids}")
 
 
 if __name__ == "__main__":

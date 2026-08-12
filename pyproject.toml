@@ -9,10 +9,11 @@ description = "Real-time energy grid intelligence platform for the Spanish elect
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+  "boto3>=1.35,<2",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
   "lightgbm>=4.5,<5",
-  "mlflow>=2.17,<4",
+  "mlflow==3.15.1",
   "numpy>=1.26,<3",
   "pandas>=2.2,<3",
   "prometheus-client>=0.21,<1",

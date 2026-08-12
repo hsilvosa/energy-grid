@@ -6,14 +6,14 @@
       "title": "Demand forecast",
       "type": "timeseries",
       "datasource": {"type": "postgres", "uid": "energy-postgres"},
-      "targets": [{"format": "time_series", "rawSql": "SELECT valid_from AS time, point AS \"P50 demand\", p10 AS \"P10 demand\", p90 AS \"P90 demand\" FROM forecasts WHERE target='demand' AND is_shadow=false ORDER BY valid_from", "refId": "A"}],
+      "targets": [{"format": "time_series", "rawSql": "SELECT valid_from AS time, point AS \"P50 demand\", p10 AS \"P10 demand\", p90 AS \"P90 demand\" FROM forecasts WHERE target='demand' AND is_shadow=false AND issue_time=(SELECT MAX(issue_time) FROM forecasts WHERE target='demand' AND is_shadow=false) ORDER BY valid_from", "refId": "A"}],
       "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}
     },
     {
       "title": "Day-ahead price forecast",
       "type": "timeseries",
       "datasource": {"type": "postgres", "uid": "energy-postgres"},
-      "targets": [{"format": "time_series", "rawSql": "SELECT valid_from AS time, point AS \"P50 price\", p10 AS \"P10 price\", p90 AS \"P90 price\" FROM forecasts WHERE target='price' AND is_shadow=false ORDER BY valid_from", "refId": "A"}],
+      "targets": [{"format": "time_series", "rawSql": "SELECT valid_from AS time, point AS \"P50 price\", p10 AS \"P10 price\", p90 AS \"P90 price\" FROM forecasts WHERE target='price' AND is_shadow=false AND issue_time=(SELECT MAX(issue_time) FROM forecasts WHERE target='price' AND is_shadow=false) ORDER BY valid_from", "refId": "A"}],
       "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}
     },
     {

@@ -1,47 +1,42 @@
 # Real-Time Energy Grid Intelligence Platform
 
-This project is a locally reproducible reference platform for electricity demand and price forecasting in the Spanish ENTSO-E bidding zone. It demonstrates the awkward engineering cases that matter in an operational forecasting system: revisions, missing measurements, out-of-order events, DST delivery days, bounded backfills, model degradation, and rollback.
+This project downloads real Spanish electricity data from ENTSO-E, combines it with Open-Meteo weather forecasts, trains LightGBM demand and price models, and serves the resulting forecasts through FastAPI and Grafana. A valid `ENTSOE_TOKEN` is required for the real-data run.
 
-The default path uses committed fixtures and does not require external credentials. Live ENTSO-E and Open-Meteo connectors are included for controlled downloads.
+The normal local path is deliberately small: ENTSO-E/Open-Meteo, a training job, PostgreSQL, MLflow, FastAPI, and Grafana. Kafka, Spark, and Iceberg remain available as an advanced, experimental streaming demonstration; they are not required to obtain or view real forecasts.
 
 For a step-by-step account of how the repository was built, the problems encountered, and instructions for obtaining an ENTSO-E API token, see [README_BUILD.md](README_BUILD.md).
+
+For an honest assessment of the current model quality, verified metrics, limitations, and promotion requirements, see [MODEL_CARD.md](MODEL_CARD.md). Real source data does not imply production-quality predictions.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Sources[ENTSO-E and Open-Meteo] --> Replay[Download or deterministic replay]
-    Replay --> Kafka[Kafka topics]
-    Kafka --> Spark[Spark Structured Streaming]
-    Spark --> Bronze[Iceberg Bronze]
-    Spark --> Silver[Iceberg Silver]
-    Silver --> Features[Leakage-safe feature jobs]
-    Features --> Models[LightGBM and SARIMAX]
+    Sources[ENTSO-E and Open-Meteo] --> Features[Time-aligned features]
+    Features --> Models[LightGBM and seasonal baseline]
     Models --> MLflow[MLflow registry]
-    Models --> Gold[Iceberg Gold]
     Models --> Postgres[(PostgreSQL serving store)]
     Postgres --> API[FastAPI]
-    API --> Prometheus[Prometheus]
-    Prometheus --> Grafana[Grafana]
     Postgres --> Grafana
+    API --> Grafana
+    Sources -. optional .-> Kafka[Kafka]
+    Kafka -. optional .-> Spark[Spark and Iceberg]
 ```
 
-Raw messages are always appended to Bronze. Silver uses deterministic business keys and revision-aware Iceberg `MERGE` operations. Events more than two hours late are isolated for bounded backfill instead of being silently discarded. Forecasts are materialized in PostgreSQL for predictable API latency and exported to Iceberg Gold for audit and analysis.
+The real-data job records source checksums and creates leakage-aware lag and weather features. Forecasts are materialized in PostgreSQL for predictable API latency. When the optional streaming profile is enabled, raw messages are also appended to Iceberg Bronze and processed into revision-aware Silver tables.
 
 ## Quick start
 
-Requirements are Python 3.11, Docker with Compose, and at least 8 GB of memory available to Docker.
+Requirements are Docker Desktop with Linux containers and Docker Compose. Python does not need to be installed on the host for the normal run.
 
-```bash
-python -m venv .venv
-.venv/Scripts/activate
-python -m pip install -e ".[dev]"
-pytest
+```powershell
+Copy-Item .env.example .env
+# Edit .env and set ENTSOE_TOKEN, then run:
 docker compose up -d --build
-docker compose run --rm demo
+docker compose run --rm live-demo
 ```
 
-On Linux or macOS, activate the environment with `source .venv/bin/activate`.
+The second command downloads approximately 45 days of actual Spanish demand and day-ahead prices, downloads matching weather forecast data, trains demand and price models, stores 24 demand forecasts and the next Spanish delivery day's price intervals, and logs both runs in MLflow. It normally takes a few minutes. Re-running it refreshes the forecasts with current source data.
 
 The main interfaces are:
 
@@ -51,14 +46,26 @@ The main interfaces are:
 - Prometheus: `http://localhost:9090`
 - MinIO console: `http://localhost:9001`, using `minio` / `minio123`
 
-Start the optional Spark/Iceberg consumer with:
+Open Grafana after `live-demo` finishes. The demand and price panels select only the newest forecast issue time, so old fixture or previous-run records do not obscure the current real result. The API response quality flags contain `real_source_data`, `entsoe_actuals`, and `open_meteo_historical_forecast`.
 
-```bash
-docker compose --profile streaming up -d spark-streaming
-docker compose run --rm demo
+For a shorter real-data run, 15 days is the supported minimum:
+
+```powershell
+docker compose run --rm live-demo python -m energy_grid.cli live-demo --history-days 15 --no-publish-kafka
 ```
 
-The demo expands a deterministic scenario into model-training data, trains LightGBM P10/P50/P90 models, publishes fixture events with injected duplicates, gaps, late arrivals, and malformed messages, and writes demand and price forecasts to PostgreSQL.
+To experiment with the advanced Kafka/Spark/Iceberg path:
+
+```powershell
+docker compose --profile streaming up -d kafka kafka-init kafka-exporter spark-streaming
+docker compose run --rm live-demo python -m energy_grid.cli live-demo --publish-kafka
+```
+
+The committed fixture scenario remains available for offline tests and deliberate failure injection:
+
+```powershell
+docker compose --profile demo --profile streaming run --rm demo
+```
 
 ## Forecast products and API
 
@@ -66,10 +73,11 @@ Demand forecasts contain 24 quarter-hour steps over the next six hours. Price fo
 
 ```bash
 curl http://localhost:8000/v1/forecasts/demand?horizon_hours=6
-curl "http://localhost:8000/v1/forecasts/prices/day-ahead?delivery_date=2026-08-07"
 curl http://localhost:8000/v1/models/status
 curl http://localhost:8000/metrics
 ```
+
+Use `http://localhost:8000/docs` to call the day-ahead price endpoint with the delivery date returned by the latest real-data run.
 
 Every forecast includes its issue time, validity interval, point estimate, P10/P50/P90 values, model version, Iceberg snapshot reference, and quality flags. Responses also expose forecast age and staleness.
 
@@ -96,11 +104,17 @@ The forecasting module contains global-horizon LightGBM quantile models, a SARIM
 
 Production training runs should log the Git commit, feature schema hash, Iceberg snapshot, source versions, training window, overall metrics, and unusual-period slice metrics to MLflow. The committed demo marks fixture-derived forecasts explicitly and must not be presented as a real market forecast.
 
-## Live data
+The current real-data models are portfolio MVP candidates, not validated champions. The verified run used only 605 demand training rows and 674 price training rows, followed by one holdout shorter than two days. Demand reached 2.75% WAPE, but P10-P90 coverage was only 34.4%; price MAE was 29.629 EUR/MWh and coverage was 45.8%. A nominal P10-P90 interval should approach 80% coverage over a representative evaluation sample. The API status `live` currently means “materialized from live-source data”, not “approved for production”.
+
+See [MODEL_CARD.md](MODEL_CARD.md) before interpreting or presenting any forecast metric.
+
+## Real-data inputs
 
 Copy `.env.example` to `.env` and set `ENTSOE_TOKEN`. Credentials must remain outside source control.
 
-The ENTSO-E connector supports actual demand, generation by type, and day-ahead price documents. The Open-Meteo connector calculates fixed population-weighted weather features for Madrid, Barcelona, Valencia, Seville, and Bilbao. Historical forecast data should be used for training; observed or reanalysis weather is suitable for monitoring but can introduce training-serving leakage if used as the model input.
+The ENTSO-E connector retrieves actual demand, generation by type, and day-ahead price documents. Price requests specify Spain as both the input and output domain, as required by the ENTSO-E API. The Open-Meteo connector calculates fixed population-weighted weather features for Madrid, Barcelona, Valencia, Seville, and Bilbao. Historical forecast data is used for training so its information set matches the live forecast interface.
+
+The token is sent only as the ENTSO-E request parameter. It is excluded from stored request metadata, error messages, model tags, and source manifests. Do not publish `.env` or the output of `docker inspect`, because container environment variables are visible there.
 
 ## AWS deployment path
 
