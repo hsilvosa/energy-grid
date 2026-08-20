@@ -33,13 +33,11 @@ def test_health_and_forecast_contracts(tmp_path: Path) -> None:
     store.create_schema()
     issue = datetime.now(UTC).replace(second=0, microsecond=0)
     demand = [
-        forecast(EventType.DEMAND, issue + timedelta(minutes=15 * i), issue)
-        for i in range(1, 25)
+        forecast(EventType.DEMAND, issue + timedelta(minutes=15 * i), issue) for i in range(1, 25)
     ]
     delivery_date = date(2025, 10, 26)
     price = [
-        forecast(EventType.PRICE, start, issue)
-        for start, _ in delivery_intervals(delivery_date)
+        forecast(EventType.PRICE, start, issue) for start, _ in delivery_intervals(delivery_date)
     ]
     store.upsert_forecasts(demand + price)
 
