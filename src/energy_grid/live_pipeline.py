@@ -117,7 +117,7 @@ def build_training_frame(
 
 
 def _value_at_or_before(series: pd.Series, timestamp: datetime) -> float:
-    eligible = series.loc[:pd.Timestamp(timestamp)]
+    eligible = series.loc[: pd.Timestamp(timestamp)]
     if eligible.empty:
         return float(series.iloc[0])
     return float(eligible.iloc[-1])
@@ -277,9 +277,7 @@ def log_training_result(result: TrainingResult, tracking_uri: str) -> str:
             }
         )
         metric_values = {
-            key: value
-            for key, value in asdict(result.metrics).items()
-            if value is not None
+            key: value for key, value in asdict(result.metrics).items() if value is not None
         }
         mlflow.log_metrics({**metric_values, "baseline_mae": result.baseline_mae})
         mlflow.set_tags(

@@ -46,4 +46,3 @@ def log_lightgbm_candidate(
         client.set_registered_model_alias(registered_model_name, "challenger", version)
         mlflow.set_tag("model_uri", model_info.model_uri)
         return version
-

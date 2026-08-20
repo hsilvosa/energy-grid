@@ -60,5 +60,5 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["confluent_kafka.*", "pandas.*", "statsmodels.*", "pyspark.*"]
+module = ["confluent_kafka.*", "pandas.*", "statsmodels.*", "pyspark.*", "pyarrow.*", "joblib.*", "lightgbm.*", "plotly.*", "gradio.*", "xgboost.*", "catboost.*", "sklearn.*"]
 ignore_missing_imports = true

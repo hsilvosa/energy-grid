@@ -53,4 +53,3 @@ def rollback_mlflow_alias(model_name: str, previous_version: str, tracking_uri: 
     set_tracking_uri(tracking_uri)
     client = MlflowClient()
     client.set_registered_model_alias(model_name, "champion", previous_version)
-

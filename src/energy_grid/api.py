@@ -99,9 +99,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         area: str = AREA_ES,
         horizon_hours: int = Query(default=6, ge=1, le=6),
     ) -> JSONResponse:
-        records = store.query_forecasts(
-            EventType.DEMAND, area=area, limit=horizon_hours * 4
-        )
+        records = store.query_forecasts(EventType.DEMAND, area=area, limit=horizon_hours * 4)
         if not records:
             return JSONResponse(
                 status_code=404,

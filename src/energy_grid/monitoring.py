@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 
-EVENTS_PUBLISHED = Counter(
-    "energy_events_published_total", "Published grid events", ["topic"]
-)
+EVENTS_PUBLISHED = Counter("energy_events_published_total", "Published grid events", ["topic"])
 EVENTS_LATE = Counter("energy_late_events_total", "Events received after the watermark", ["source"])
 EVENTS_DEAD_LETTER = Counter(
     "energy_dead_letter_events_total", "Events rejected by validation", ["reason"]
