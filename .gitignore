@@ -17,4 +17,8 @@ data/runtime/
 artifacts/
 checkpoints/
 spark-warehouse/
+catboost_info/
+mlruns/
+hf_models/
+reports/
 
