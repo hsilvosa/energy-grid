@@ -37,4 +37,3 @@ def floor_quarter_hour(timestamp: datetime) -> datetime:
         raise ValueError("timestamp must be timezone aware")
     timestamp = timestamp.astimezone(UTC)
     return timestamp.replace(minute=(timestamp.minute // 15) * 15, second=0, microsecond=0)
-

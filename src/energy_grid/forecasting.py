@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol
 
 import numpy as np
 import pandas as pd
@@ -20,51 +22,123 @@ class ForecastMetrics:
     pinball_p10: float
     pinball_p90: float
     interval_coverage: float
+    winkler_score: float | None = None
+    mape: float | None = None
+
+    def to_dict(self) -> dict[str, float | None]:
+        return asdict(self)
 
 
-def pinball_loss(actual: np.ndarray, predicted: np.ndarray, quantile: float) -> float:
+def pinball_loss(
+    actual: np.ndarray[Any, Any], predicted: np.ndarray[Any, Any], quantile: float
+) -> float:
+    """Compute asymmetric pinball loss for a specific quantile alpha."""
     error = actual - predicted
     return float(np.mean(np.maximum(quantile * error, (quantile - 1) * error)))
 
 
+def winkler_score(
+    actual: np.ndarray[Any, Any],
+    lower: np.ndarray[Any, Any],
+    upper: np.ndarray[Any, Any],
+    alpha: float = 0.2,
+) -> float:
+    """Compute Winkler Interval Score for a (1 - alpha) prediction interval."""
+    spread = upper - lower
+    under = (2.0 / alpha) * (lower - actual) * (actual < lower)
+    over = (2.0 / alpha) * (actual - upper) * (actual > upper)
+    return float(np.mean(spread + under + over))
+
+
 def evaluate(
-    actual: np.ndarray,
-    point: np.ndarray,
-    p10: np.ndarray,
-    p90: np.ndarray,
+    actual: np.ndarray[Any, Any],
+    point: np.ndarray[Any, Any],
+    p10: np.ndarray[Any, Any],
+    p90: np.ndarray[Any, Any],
     *,
     allow_wape: bool = True,
+    alpha: float = 0.2,
 ) -> ForecastMetrics:
+    """Evaluate point and quantile forecasts with complete probabilistic and accuracy metrics."""
     if not (len(actual) == len(point) == len(p10) == len(p90)) or not len(actual):
         raise ValueError("metric arrays must be non-empty and have equal length")
     error = actual - point
+    abs_error = np.abs(error)
     denominator = float(np.sum(np.abs(actual)))
-    wape = float(np.sum(np.abs(error)) / denominator) if allow_wape and denominator else None
+    wape = float(np.sum(abs_error) / denominator) if allow_wape and denominator else None
+
+    # MAPE where non-zero actuals
+    non_zero = np.abs(actual) > 1e-3
+    mape = (
+        float(np.mean(abs_error[non_zero] / np.abs(actual[non_zero]))) * 100.0
+        if np.any(non_zero)
+        else None
+    )
+
+    coverage = float(np.mean((actual >= p10) & (actual <= p90)))
+    w_score = winkler_score(actual, p10, p90, alpha=alpha)
+
     return ForecastMetrics(
-        mae=float(np.mean(np.abs(error))),
+        mae=float(np.mean(abs_error)),
         rmse=float(math.sqrt(np.mean(np.square(error)))),
         wape=wape,
+        mape=mape,
         pinball_p10=pinball_loss(actual, p10, 0.1),
         pinball_p90=pinball_loss(actual, p90, 0.9),
-        interval_coverage=float(np.mean((actual >= p10) & (actual <= p90))),
+        interval_coverage=coverage,
+        winkler_score=w_score,
     )
+
+
+class ConformalCalibrator:
+    """Split-conformal prediction calibrator with adaptive interval scaling."""
+
+    def __init__(self, target_coverage: float = 0.80, adaptive: bool = True) -> None:
+        self.target_coverage = target_coverage
+        self.adaptive = adaptive
+        self.q_correction: float = 0.0
+        self.is_fitted: bool = False
+
+    def fit(
+        self, actual: np.ndarray[Any, Any], p10: np.ndarray[Any, Any], p90: np.ndarray[Any, Any]
+    ) -> ConformalCalibrator:
+        """Fit empirical conformity adjustment on a dedicated calibration split."""
+        if len(actual) == 0:
+            raise ValueError("Calibration data cannot be empty")
+
+        raw_scores = np.maximum(p10 - actual, actual - p90)
+        if self.adaptive:
+            widths = (p90 - p10) + 1e-4
+            scores = raw_scores / widths
+        else:
+            scores = raw_scores
+
+        # Compute empirical quantile of conformity scores
+        n = len(scores)
+        q_level = min(1.0, math.ceil((n + 1) * self.target_coverage) / n)
+        self.q_correction = float(np.quantile(scores, q_level, method="higher"))
+        self.is_fitted = True
+        return self
+
+    def calibrate(
+        self, p10: np.ndarray[Any, Any], p90: np.ndarray[Any, Any]
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        """Apply conformal correction to broaden or narrow prediction intervals."""
+        if not self.is_fitted:
+            return p10, p90
+        if self.adaptive:
+            widths = (p90 - p10) + 1e-4
+            cal_p10 = p10 - self.q_correction * widths
+            cal_p90 = p90 + self.q_correction * widths
+        else:
+            cal_p10 = p10 - self.q_correction
+            cal_p90 = p90 + self.q_correction
+        return cal_p10, cal_p90
 
 
 class QuantileForecaster(Protocol):
     model_name: str
     model_version: str
-
-    def predict(self, features: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
-
-
-class LightGBMQuantileForecaster:
-    model_name = "lightgbm-global-horizon"
-
-    def __init__(self, model_version: str = "untrained", random_state: int = 42) -> None:
-        self.model_version = model_version
-        self.random_state = random_state
-        self.feature_names: list[str] = []
-        self.models: dict[float, Any] = {}
 
     def fit(
         self,
@@ -72,33 +146,534 @@ class LightGBMQuantileForecaster:
         target: pd.Series,
         *,
         feature_names: list[str],
+        calibration_fraction: float = 0.0,
+    ) -> Any: ...
+
+    def predict(
+        self,
+        features: pd.DataFrame,
+        *,
+        apply_calibration: bool = True,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]: ...
+
+
+class LightGBMQuantileForecaster:
+    """Multi-quantile LightGBM forecaster with monotonicity enforcement."""
+
+    model_name = "lightgbm-quantile"
+
+    def __init__(
+        self,
+        model_version: str = "untrained",
+        n_estimators: int = 200,
+        learning_rate: float = 0.05,
+        num_leaves: int = 31,
+        random_state: int = 42,
+    ) -> None:
+        self.model_version = model_version
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.num_leaves = num_leaves
+        self.random_state = random_state
+        self.feature_names: list[str] = []
+        self.models: dict[float, Any] = {}
+        self.calibrator: ConformalCalibrator | None = None
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        *,
+        feature_names: list[str],
+        calibration_fraction: float = 0.0,
     ) -> LightGBMQuantileForecaster:
         from lightgbm import LGBMRegressor
 
-        self.feature_names = feature_names
+        self.feature_names = list(feature_names)
+        X = features[self.feature_names]
+        y = target.astype(float)
+
+        if calibration_fraction > 0.0:
+            cal_size = max(96, int(len(X) * calibration_fraction))
+            X_train, y_train = X.iloc[:-cal_size], y.iloc[:-cal_size]
+            X_cal, y_cal = X.iloc[-cal_size:], y.iloc[-cal_size:]
+        else:
+            X_train, y_train = X, y
+            X_cal, y_cal = None, None
+
         for quantile in (0.1, 0.5, 0.9):
             model = LGBMRegressor(
                 objective="quantile",
                 alpha=quantile,
-                n_estimators=160,
-                learning_rate=0.05,
-                num_leaves=31,
+                n_estimators=self.n_estimators,
+                learning_rate=self.learning_rate,
+                num_leaves=self.num_leaves,
                 random_state=self.random_state,
                 verbosity=-1,
+                n_jobs=-1,
             )
-            model.fit(features[feature_names], target)
+            model.fit(X_train, y_train)
             self.models[quantile] = model
+
+        if X_cal is not None and y_cal is not None:
+            raw_p10 = self.models[0.1].predict(X_cal)
+            raw_p50 = self.models[0.5].predict(X_cal)
+            raw_p90 = self.models[0.9].predict(X_cal)
+            stacked = np.sort(np.vstack([raw_p10, raw_p50, raw_p90]), axis=0)
+            self.calibrator = ConformalCalibrator(target_coverage=0.80).fit(
+                y_cal.to_numpy(), stacked[0], stacked[2]
+            )
+
         self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         return self
 
-    def predict(self, features: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict(
+        self,
+        features: pd.DataFrame,
+        *,
+        apply_calibration: bool = True,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        """Predict P10, P50, P90 quantiles with monotonicity and optional conformal calibration."""
         if set(self.models) != {0.1, 0.5, 0.9}:
             raise RuntimeError("forecaster is not trained")
-        predictions = [
-            self.models[q].predict(features[self.feature_names]) for q in (0.1, 0.5, 0.9)
-        ]
-        stacked = np.sort(np.vstack(predictions), axis=0)
+        X = features[self.feature_names]
+        raw_p10 = self.models[0.1].predict(X)
+        raw_p50 = self.models[0.5].predict(X)
+        raw_p90 = self.models[0.9].predict(X)
+
+        # Monotonicity post-processing: p10 <= p50 <= p90
+        stacked = np.sort(np.vstack([raw_p10, raw_p50, raw_p90]), axis=0)
+        p10, p50, p90 = stacked[0], stacked[1], stacked[2]
+
+        if apply_calibration and self.calibrator is not None and self.calibrator.is_fitted:
+            p10, p90 = self.calibrator.calibrate(p10, p90)
+            stacked_cal = np.sort(np.vstack([p10, p50, p90]), axis=0)
+            p10, p50, p90 = stacked_cal[0], stacked_cal[1], stacked_cal[2]
+
+        return p10, p50, p90
+
+    def get_feature_importances(self) -> dict[str, float]:
+        """Get feature importance from point forecast (P50) model."""
+        if 0.5 not in self.models:
+            return {}
+        p50_model = self.models[0.5]
+        importances = p50_model.feature_importances_
+        return dict(zip(self.feature_names, [float(v) for v in importances], strict=True))
+
+    def save(self, directory: Path | str) -> None:
+        """Save model artifacts and configuration to directory."""
+        import joblib
+
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self.models, path / "models.joblib")
+        meta = {
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "feature_names": self.feature_names,
+            "n_estimators": self.n_estimators,
+            "learning_rate": self.learning_rate,
+            "num_leaves": self.num_leaves,
+            "calibrator_fitted": self.calibrator.is_fitted if self.calibrator else False,
+            "q_correction": self.calibrator.q_correction if self.calibrator else 0.0,
+        }
+        (path / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, directory: Path | str) -> LightGBMQuantileForecaster:
+        """Load forecaster from serialized directory."""
+        import joblib
+
+        path = Path(directory)
+        meta_file = (
+            path / "config.json" if (path / "config.json").exists() else path / "metadata.json"
+        )
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        instance = cls(
+            model_version=meta.get("model_version", "unknown"),
+            n_estimators=meta.get("n_estimators", 100),
+            learning_rate=meta.get("learning_rate", 0.05),
+            num_leaves=meta.get("num_leaves", 31),
+        )
+        instance.feature_names = meta["feature_names"]
+        instance.models = joblib.load(path / "models.joblib")
+        cal_data = meta.get("calibrator", {})
+        if meta.get("calibrator_fitted") or cal_data.get("is_fitted"):
+            q_corr = meta.get("q_correction") or cal_data.get("q_correction", 0.0)
+            instance.calibrator = ConformalCalibrator()
+            instance.calibrator.q_correction = float(q_corr)
+            instance.calibrator.is_fitted = True
+        return instance
+
+
+class XGBoostQuantileForecaster:
+    """Multi-quantile XGBoost forecaster."""
+
+    model_name = "xgboost-quantile"
+
+    def __init__(
+        self,
+        model_version: str = "untrained",
+        n_estimators: int = 200,
+        learning_rate: float = 0.05,
+        max_depth: int = 6,
+        random_state: int = 42,
+    ) -> None:
+        self.model_version = model_version
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+        self.random_state = random_state
+        self.feature_names: list[str] = []
+        self.models: dict[float, Any] = {}
+        self.calibrator: ConformalCalibrator | None = None
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        *,
+        feature_names: list[str],
+        calibration_fraction: float = 0.0,
+    ) -> XGBoostQuantileForecaster:
+        from xgboost import XGBRegressor
+
+        self.feature_names = list(feature_names)
+        X = features[self.feature_names]
+        y = target.astype(float)
+
+        if calibration_fraction > 0.0:
+            cal_size = max(96, int(len(X) * calibration_fraction))
+            X_train, y_train = X.iloc[:-cal_size], y.iloc[:-cal_size]
+            X_cal, y_cal = X.iloc[-cal_size:], y.iloc[-cal_size:]
+        else:
+            X_train, y_train = X, y
+            X_cal, y_cal = None, None
+
+        for quantile in (0.1, 0.5, 0.9):
+            model = XGBRegressor(
+                objective="reg:quantileerror",
+                quantile_alpha=quantile,
+                n_estimators=self.n_estimators,
+                learning_rate=self.learning_rate,
+                max_depth=self.max_depth,
+                random_state=self.random_state,
+                n_jobs=-1,
+            )
+            model.fit(X_train, y_train)
+            self.models[quantile] = model
+
+        if X_cal is not None and y_cal is not None:
+            raw_p10 = self.models[0.1].predict(X_cal)
+            raw_p50 = self.models[0.5].predict(X_cal)
+            raw_p90 = self.models[0.9].predict(X_cal)
+            stacked = np.sort(np.vstack([raw_p10, raw_p50, raw_p90]), axis=0)
+            self.calibrator = ConformalCalibrator(target_coverage=0.80).fit(
+                y_cal.to_numpy(), stacked[0], stacked[2]
+            )
+
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        return self
+
+    def predict(
+        self,
+        features: pd.DataFrame,
+        *,
+        apply_calibration: bool = True,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        X = features[self.feature_names]
+        raw_p10 = self.models[0.1].predict(X)
+        raw_p50 = self.models[0.5].predict(X)
+        raw_p90 = self.models[0.9].predict(X)
+
+        stacked = np.sort(np.vstack([raw_p10, raw_p50, raw_p90]), axis=0)
+        p10, p50, p90 = stacked[0], stacked[1], stacked[2]
+
+        if apply_calibration and self.calibrator is not None and self.calibrator.is_fitted:
+            p10, p90 = self.calibrator.calibrate(p10, p90)
+            stacked_cal = np.sort(np.vstack([p10, p50, p90]), axis=0)
+            p10, p50, p90 = stacked_cal[0], stacked_cal[1], stacked_cal[2]
+
+        return p10, p50, p90
+
+    def get_feature_importances(self) -> dict[str, float]:
+        if 0.5 not in self.models:
+            return {}
+        p50_model = self.models[0.5]
+        importances = p50_model.feature_importances_
+        return dict(zip(self.feature_names, [float(v) for v in importances], strict=True))
+
+
+class CatBoostQuantileForecaster:
+    """Multi-quantile CatBoost forecaster."""
+
+    model_name = "catboost-quantile"
+
+    def __init__(
+        self,
+        model_version: str = "untrained",
+        iterations: int = 300,
+        learning_rate: float = 0.05,
+        depth: int = 6,
+        random_seed: int = 42,
+    ) -> None:
+        self.model_version = model_version
+        self.iterations = iterations
+        self.learning_rate = learning_rate
+        self.depth = depth
+        self.random_seed = random_seed
+        self.feature_names: list[str] = []
+        self.models: dict[float, Any] = {}
+        self.calibrator: ConformalCalibrator | None = None
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        *,
+        feature_names: list[str],
+        calibration_fraction: float = 0.0,
+    ) -> CatBoostQuantileForecaster:
+        from catboost import CatBoostRegressor
+
+        self.feature_names = list(feature_names)
+        X = features[self.feature_names]
+        y = target.astype(float)
+
+        if calibration_fraction > 0.0:
+            cal_size = max(96, int(len(X) * calibration_fraction))
+            X_train, y_train = X.iloc[:-cal_size], y.iloc[:-cal_size]
+            X_cal, y_cal = X.iloc[-cal_size:], y.iloc[-cal_size:]
+        else:
+            X_train, y_train = X, y
+            X_cal, y_cal = None, None
+
+        for quantile in (0.1, 0.5, 0.9):
+            model = CatBoostRegressor(
+                loss_function=f"Quantile:alpha={quantile}",
+                iterations=self.iterations,
+                learning_rate=self.learning_rate,
+                depth=self.depth,
+                random_seed=self.random_seed,
+                verbose=False,
+            )
+            model.fit(X_train, y_train)
+            self.models[quantile] = model
+
+        if X_cal is not None and y_cal is not None:
+            raw_p10 = self.models[0.1].predict(X_cal)
+            raw_p50 = self.models[0.5].predict(X_cal)
+            raw_p90 = self.models[0.9].predict(X_cal)
+            stacked = np.sort(np.vstack([raw_p10, raw_p50, raw_p90]), axis=0)
+            self.calibrator = ConformalCalibrator(target_coverage=0.80).fit(
+                y_cal.to_numpy(), stacked[0], stacked[2]
+            )
+
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        return self
+
+    def predict(
+        self,
+        features: pd.DataFrame,
+        *,
+        apply_calibration: bool = True,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        X = features[self.feature_names]
+        raw_p10 = self.models[0.1].predict(X)
+        raw_p50 = self.models[0.5].predict(X)
+        raw_p90 = self.models[0.9].predict(X)
+
+        stacked = np.sort(np.vstack([raw_p10, raw_p50, raw_p90]), axis=0)
+        p10, p50, p90 = stacked[0], stacked[1], stacked[2]
+
+        if apply_calibration and self.calibrator is not None and self.calibrator.is_fitted:
+            p10, p90 = self.calibrator.calibrate(p10, p90)
+            stacked_cal = np.sort(np.vstack([p10, p50, p90]), axis=0)
+            p10, p50, p90 = stacked_cal[0], stacked_cal[1], stacked_cal[2]
+
+        return p10, p50, p90
+
+    def get_feature_importances(self) -> dict[str, float]:
+        if 0.5 not in self.models:
+            return {}
+        p50_model = self.models[0.5]
+        importances = p50_model.get_feature_importance()
+        return dict(zip(self.feature_names, [float(v) for v in importances], strict=True))
+
+
+class StackedQuantileEnsemble:
+    """Blended ensemble of LightGBM, XGBoost, and CatBoost quantile forecasters."""
+
+    model_name = "stacked-ensemble-quantile"
+
+    def __init__(
+        self,
+        model_version: str = "untrained",
+        weights: tuple[float, float, float] = (0.45, 0.35, 0.20),
+    ) -> None:
+        self.model_version = model_version
+        self.weights = weights
+        self.lgbm = LightGBMQuantileForecaster()
+        self.xgb = XGBoostQuantileForecaster()
+        self.cat = CatBoostQuantileForecaster()
+        self.calibrator: ConformalCalibrator | None = None
+        self.feature_names: list[str] = []
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        *,
+        feature_names: list[str],
+        calibration_fraction: float = 0.15,
+    ) -> StackedQuantileEnsemble:
+        self.feature_names = list(feature_names)
+        self.lgbm.fit(
+            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+        )
+        self.xgb.fit(
+            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+        )
+        self.cat.fit(
+            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+        )
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        return self
+
+    def predict(
+        self,
+        features: pd.DataFrame,
+        *,
+        apply_calibration: bool = True,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        w1, w2, w3 = self.weights
+        p10_1, p50_1, p90_1 = self.lgbm.predict(features, apply_calibration=False)
+        p10_2, p50_2, p90_2 = self.xgb.predict(features, apply_calibration=False)
+        p10_3, p50_3, p90_3 = self.cat.predict(features, apply_calibration=False)
+
+        p10 = w1 * p10_1 + w2 * p10_2 + w3 * p10_3
+        p50 = w1 * p50_1 + w2 * p50_2 + w3 * p50_3
+        p90 = w1 * p90_1 + w2 * p90_2 + w3 * p90_3
+
+        stacked = np.sort(np.vstack([p10, p50, p90]), axis=0)
+        p10, p50, p90 = stacked[0], stacked[1], stacked[2]
+
+        if apply_calibration and self.lgbm.calibrator and self.lgbm.calibrator.is_fitted:
+            p10, p90 = self.lgbm.calibrator.calibrate(p10, p90)
+            stacked_cal = np.sort(np.vstack([p10, p50, p90]), axis=0)
+            p10, p50, p90 = stacked_cal[0], stacked_cal[1], stacked_cal[2]
+
+        return p10, p50, p90
+
+    def get_feature_importances(self) -> dict[str, float]:
+        lgbm_imp = self.lgbm.get_feature_importances()
+        xgb_imp = self.xgb.get_feature_importances()
+        merged = {}
+        for k in self.feature_names:
+            merged[k] = float(0.6 * lgbm_imp.get(k, 0.0) + 0.4 * xgb_imp.get(k, 0.0))
+        return merged
+
+
+class DualHorizonEnsembleForecaster:
+    """Dual-model strategy combining a specialized Short-Horizon (1-6h) model
+
+    and a Long-Horizon (24-48h) model with smooth lead-time transition.
+    """
+
+    model_name = "dual-horizon-hybrid"
+
+    def __init__(
+        self,
+        model_version: str = "untrained",
+        switch_horizon_steps: int = 24,  # e.g. 24 steps = 6 hours on 15-min data
+    ) -> None:
+        self.model_version = model_version
+        self.switch_horizon_steps = switch_horizon_steps
+        self.short_model = LightGBMQuantileForecaster(n_estimators=180, learning_rate=0.04)
+        self.long_model = LightGBMQuantileForecaster(n_estimators=240, learning_rate=0.04)
+        self.feature_names: list[str] = []
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+        *,
+        feature_names: list[str],
+        calibration_fraction: float = 0.15,
+    ) -> DualHorizonEnsembleForecaster:
+        self.feature_names = list(feature_names)
+        self.short_model.fit(
+            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+        )
+        self.long_model.fit(
+            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+        )
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        return self
+
+    def predict(
+        self,
+        features: pd.DataFrame,
+        *,
+        apply_calibration: bool = True,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        """Predict with dynamic decay from short-horizon to long-horizon model."""
+        p10_s, p50_s, p90_s = self.short_model.predict(
+            features, apply_calibration=apply_calibration
+        )
+        p10_l, p50_l, p90_l = self.long_model.predict(features, apply_calibration=apply_calibration)
+
+        n = len(features)
+        # Decay factor: step 1 is short-term, transitions smoothly to long-term
+        steps = np.arange(n)
+        alpha = np.maximum(0.0, 1.0 - (steps / float(self.switch_horizon_steps)))
+        alpha = np.clip(alpha, 0.0, 1.0)
+
+        p10 = alpha * p10_s + (1.0 - alpha) * p10_l
+        p50 = alpha * p50_s + (1.0 - alpha) * p50_l
+        p90 = alpha * p90_s + (1.0 - alpha) * p90_l
+
+        stacked = np.sort(np.vstack([p10, p50, p90]), axis=0)
         return stacked[0], stacked[1], stacked[2]
+
+    def get_feature_importances(self) -> dict[str, float]:
+        return self.short_model.get_feature_importances()
+
+
+def create_forecaster(
+    model_type: (
+        Literal["lightgbm", "xgboost", "catboost", "stacked", "dual_horizon"]
+    ) = "lightgbm",
+    **kwargs: Any,
+) -> Any:
+    """Factory to instantiate the desired quantile forecaster architecture."""
+    if model_type == "lightgbm":
+        return LightGBMQuantileForecaster(**kwargs)
+    elif model_type == "xgboost":
+        return XGBoostQuantileForecaster(**kwargs)
+    elif model_type == "catboost":
+        return CatBoostQuantileForecaster(**kwargs)
+    elif model_type == "stacked":
+        return StackedQuantileEnsemble()
+    elif model_type == "dual_horizon":
+        return DualHorizonEnsembleForecaster(**kwargs)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+
+class PersistenceBaseline:
+    """Seasonal persistence baseline for 24-hour or 7-day benchmarks."""
+
+    def __init__(self, steps_lag: int = 96) -> None:
+        self.steps_lag = steps_lag
+
+    def predict(self, series: pd.Series, horizon_steps: int) -> np.ndarray[Any, Any]:
+        """Predict using the values from steps_lag ago."""
+        if len(series) < self.steps_lag:
+            raise ValueError(f"Series has {len(series)} points; need at least {self.steps_lag}")
+        history = series.iloc[-self.steps_lag :].to_numpy()
+        repeated = np.tile(history, math.ceil(horizon_steps / len(history)))
+        return repeated[:horizon_steps].astype(float)
 
 
 class SarimaxBaseline:
@@ -120,7 +695,9 @@ class SarimaxBaseline:
         ).fit(disp=False, maxiter=50)
         return self
 
-    def predict(self, steps: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict(
+        self, steps: int
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
         if self.result is None:
             raise RuntimeError("baseline is not trained")
         forecast = self.result.get_forecast(steps=steps)

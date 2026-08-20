@@ -106,9 +106,7 @@ class GridEvent(BaseModel):
         return cls.model_validate_json(value)
 
     def with_checksum(self, raw_payload: bytes) -> GridEvent:
-        return self.model_copy(
-            update={"payload_checksum": hashlib.sha256(raw_payload).hexdigest()}
-        )
+        return self.model_copy(update={"payload_checksum": hashlib.sha256(raw_payload).hexdigest()})
 
 
 class ForecastRecord(BaseModel):
@@ -152,4 +150,3 @@ class ForecastRecord(BaseModel):
             separators=(",", ":"),
         )
         return hashlib.sha256(raw.encode()).hexdigest()
-
