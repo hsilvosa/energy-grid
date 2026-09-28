@@ -7,8 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from energy_grid.domain import MADRID, EventType
-from energy_grid.features import build_multiscale_features
+from energy_grid.domain import EventType
+from energy_grid.features import build_horizon_features
 from energy_grid.forecasting import (
     ForecastMetrics,
     LightGBMQuantileForecaster,
@@ -33,6 +33,9 @@ class FoldResult:
 @dataclass
 class BacktestReport:
     target: EventType
+    country_code: str
+    horizon_steps: int
+    steps_per_day: int
     overall_metrics: ForecastMetrics
     baseline_24h_metrics: ForecastMetrics
     baseline_7d_metrics: ForecastMetrics
@@ -50,6 +53,9 @@ class BacktestReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "target": self.target.value,
+            "country_code": self.country_code,
+            "horizon_steps": self.horizon_steps,
+            "steps_per_day": self.steps_per_day,
             "overall_metrics": self.overall_metrics.to_dict(),
             "baseline_24h_metrics": self.baseline_24h_metrics.to_dict(),
             "baseline_7d_metrics": self.baseline_7d_metrics.to_dict(),
@@ -68,6 +74,8 @@ class BacktestReport:
     def to_markdown(self) -> str:
         target_name = self.target.value.upper()
         unit = "MW" if self.target == EventType.DEMAND else "EUR/MWh"
+        daily_label = f"{max(self.horizon_steps, self.steps_per_day)}-step baseline"
+        weekly_label = f"{max(self.horizon_steps, self.steps_per_day * 7)}-step baseline"
 
         m_wape = f"{self.overall_metrics.wape * 100:.2f}%" if self.overall_metrics.wape else "N/A"
         b24_wape = (
@@ -84,9 +92,12 @@ class BacktestReport:
         lines = [
             f"# Rolling-Origin Multi-Year Backtest Report: {target_name}",
             "",
+            f"Forecast lead time: {self.horizon_steps} intervals. "
+            "Training labels are purged at each origin.",
+            "",
             "## Summary Metrics",
             "",
-            "| Metric | LightGBM Model | 24h Baseline | 7d Baseline | Improvement vs 7d |",
+            f"| Metric | LightGBM Model | {daily_label} | {weekly_label} | Improvement vs 7d |",
             "|---|---:|---:|---:|---:|",
             (
                 f"| **MAE** | **{self.overall_metrics.mae:.3f} {unit}** | "
@@ -173,10 +184,18 @@ def run_rolling_backtest(
     step_days: int = 30,
     calibration_fraction: float = 0.15,
     steps_per_day: int = 96,
+    horizon_steps: int | None = None,
+    country_code: str = "ES",
 ) -> BacktestReport:
     """Perform multi-year rolling-origin time-series cross validation with slice analysis."""
-    df = build_multiscale_features(
-        target_series, exogenous_series=exogenous_series, steps_per_day=steps_per_day
+    lead = steps_per_day if horizon_steps is None else horizon_steps
+    if min(train_days, test_days, step_days) < 1:
+        raise ValueError("train_days, test_days, and step_days must be positive")
+    if exogenous_series is not None:
+        raise ValueError("exogenous_series requires publication times and is not yet supported")
+    df = build_horizon_features(
+        target_series, horizon_steps=lead, steps_per_day=steps_per_day,
+        country_code=country_code,
     )
     feature_names = [col for col in df.columns if col != "target"]
 
@@ -205,8 +224,12 @@ def run_rolling_backtest(
     fold_idx = 1
 
     for start_idx in range(train_size, len(df) - test_size + 1, step_size):
-        train_df = df.iloc[start_idx - train_size : start_idx]
+        # The first test prediction is issued lead intervals before its valid time.
+        # Labels from this gap would not be known when the model is fitted.
+        train_df = df.iloc[start_idx - train_size : start_idx - lead]
         test_df = df.iloc[start_idx : start_idx + test_size]
+        if train_df.empty:
+            raise ValueError("train_days must exceed the forecast horizon")
 
         # Fit model on training slice
         forecaster = LightGBMQuantileForecaster(
@@ -222,8 +245,10 @@ def run_rolling_backtest(
         cal_p10, cal_p50, cal_p90 = forecaster.predict(test_df, apply_calibration=True)
 
         actuals = test_df["target"].to_numpy()
-        base_24h = test_df["lag_24h"].to_numpy()
-        base_7d = test_df["lag_7d"].to_numpy()
+        base_24h = target_series.shift(max(lead, steps_per_day)).reindex(test_df.index).to_numpy()
+        base_7d = (
+            target_series.shift(max(lead, steps_per_day * 7)).reindex(test_df.index).to_numpy()
+        )
 
         # Fold metrics
         m_metrics = evaluate(
@@ -307,7 +332,13 @@ def run_rolling_backtest(
             "abs_error": np.abs(arr_actuals - arr_points),
         }
     )
-    eval_df["local_time"] = pd.DatetimeIndex(eval_df["timestamp"]).tz_convert(MADRID)
+    from zoneinfo import ZoneInfo
+
+    from energy_grid.features import MARKET_TIMEZONES
+
+    eval_df["local_time"] = pd.DatetimeIndex(eval_df["timestamp"]).tz_convert(
+        ZoneInfo(MARKET_TIMEZONES[country_code.upper()])
+    )
     eval_df["hour"] = eval_df["local_time"].dt.hour
     eval_df["month"] = eval_df["local_time"].dt.month
     eval_df["day_of_week"] = eval_df["local_time"].dt.dayofweek
@@ -355,6 +386,9 @@ def run_rolling_backtest(
 
     return BacktestReport(
         target=target,
+        country_code=country_code,
+        horizon_steps=lead,
+        steps_per_day=steps_per_day,
         overall_metrics=overall_metrics,
         baseline_24h_metrics=overall_b24,
         baseline_7d_metrics=overall_b7d,

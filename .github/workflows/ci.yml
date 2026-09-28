@@ -11,11 +11,14 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
@@ -55,4 +58,3 @@ jobs:
           tags: energy-grid:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-

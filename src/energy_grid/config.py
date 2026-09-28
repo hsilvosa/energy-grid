@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,6 +14,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///data/runtime/energy.db"
     kafka_bootstrap_servers: str = "localhost:29092"
     mlflow_tracking_uri: str = "http://localhost:5000"
+    model_artifact_root: Path = Path("artifacts/models")
     entsoe_token: str | None = None
     event_watermark_minutes: int = Field(default=120, ge=1)
     forecast_stale_after_minutes: int = Field(default=30, ge=1)

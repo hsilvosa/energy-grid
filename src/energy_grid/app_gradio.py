@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from energy_grid.domain import EventType
-from energy_grid.features import build_multiscale_features
+from energy_grid.features import build_horizon_features
 from energy_grid.forecasting import create_forecaster
 from energy_grid.sources.dataset_reader import DEFAULT_DATASET_PATH, EntsoeDatasetReader
 
@@ -48,6 +48,8 @@ def create_interactive_forecast_dashboard(
     actuals: np.ndarray[Any, Any] | None = None,
     history_times: pd.DatetimeIndex | None = None,
     history_vals: np.ndarray[Any, Any] | None = None,
+    lead_times: pd.DatetimeIndex | None = None,
+    lead_vals: np.ndarray[Any, Any] | None = None,
     country_label: str = "Spain",
     target_name: str = "Demand",
     unit: str = "MW",
@@ -77,6 +79,33 @@ def create_interactive_forecast_dashboard(
                 line=dict(color="#475569", width=1.5),
                 hoverinfo="x+y",
             ),
+            row=1,
+            col=1,
+        )
+
+    # Observations inside the lead window are useful for retrospective context,
+    # but they were unavailable at the model input cutoff and are never features.
+    if lead_times is not None and lead_vals is not None and len(lead_times):
+        fig.add_trace(
+            go.Scatter(
+                x=lead_times,
+                y=lead_vals,
+                mode="lines",
+                name="Lead Window Actuals (Not Used)",
+                line=dict(color="#f59e0b", width=1.5, dash="dash"),
+                hoverinfo="x+y",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_vrect(
+            x0=lead_times.min(),
+            x1=timestamps.min(),
+            fillcolor="#f59e0b",
+            opacity=0.08,
+            line_width=0,
+            annotation_text="24 h lead window",
+            annotation_position="top left",
             row=1,
             col=1,
         )
@@ -216,6 +245,7 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
 
     def forecast_interface(
         country_code: str,
+        zone_key: str,
         target_choice: str,
         model_type: str,
         test_date_str: str,
@@ -227,18 +257,22 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
         unit = "MW" if target == EventType.DEMAND else "EUR/MWh"
 
         # Load series for selected European country
-        series = reader.load_series(
-            target,
-            country_code=country_code,
-            start_year=2023,
-            end_year=2026,
-            resample_freq="15min" if target == EventType.DEMAND else "60min",
-        )
+        try:
+            series = reader.load_series(
+                target, country_code=country_code, zone_key=zone_key.strip() or None,
+                start_year=2023, end_year=2026,
+                resample_freq="15min" if target == EventType.DEMAND else "60min",
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return None, f"Error: {exc}", {}
         if series.empty:
             return None, f"Error: No data found for {country_code} in dataset directory.", {}
 
         # Feature engineering
-        df = build_multiscale_features(series, steps_per_day=steps_per_day)
+        df = build_horizon_features(
+            series, horizon_steps=steps_per_day, steps_per_day=steps_per_day,
+            country_code=country_code,
+        )
         feature_names = [c for c in df.columns if c != "target"]
 
         # Parse test date
@@ -261,8 +295,29 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
             train_df = df.iloc[:-steps_per_day]
             test_df = df.tail(steps_per_day)
 
+        # Labels inside the lead-time gap are unknown at the first test origin.
+        first_test_pos = df.index.get_loc(test_df.index[0])
+        train_df = df.iloc[: max(0, first_test_pos - steps_per_day)]
+        if len(train_df) < steps_per_day * 10:
+            return None, "Error: too little history before the selected forecast origins.", {}
+        history_df = train_df
+        lead_context = series[
+            (series.index > history_df.index.max()) & (series.index < test_df.index.min())
+        ]
+        if model_type == "dual_horizon":
+            short_df = build_horizon_features(
+                series, horizon_steps=1, steps_per_day=steps_per_day,
+                country_code=country_code,
+            )
+            short_df = short_df[short_df.index <= train_df.index.max()]
+            train_df = pd.concat([train_df, short_df]).sort_index(kind="stable")
+
         # Train model
-        model = create_forecaster(model_type)  # type: ignore[arg-type]
+        model_options = (
+            {"switch_horizon_steps": 6 * steps_per_day // 24}
+            if model_type == "dual_horizon" else {}
+        )
+        model = create_forecaster(model_type, **model_options)  # type: ignore[arg-type]
         model.fit(
             train_df,
             train_df["target"],
@@ -275,9 +330,13 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
 
         # Historical context window requested by user (e.g. 7, 14, 30 days)
         hist_steps = steps_per_day * history_days
-        hist_df = train_df.tail(hist_steps)
+        hist_df = history_df.tail(hist_steps)
 
-        country_name = dict(COUNTRY_OPTIONS).get(country_code, country_code)
+        country_name = dict((code, label) for label, code in COUNTRY_OPTIONS).get(
+            country_code, country_code
+        )
+        if zone_key.strip():
+            country_name += f" / {zone_key.strip()}"
         fig = create_interactive_forecast_dashboard(
             timestamps=test_df.index,
             p50=p50,
@@ -286,6 +345,8 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
             actuals=actuals,
             history_times=hist_df.index,
             history_vals=hist_df["target"].to_numpy(),
+            lead_times=pd.DatetimeIndex(lead_context.index),
+            lead_vals=lead_context.to_numpy(),
             country_label=country_name,
             target_name=target.value.capitalize(),
             unit=unit,
@@ -296,6 +357,10 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
         denom = float(np.sum(np.abs(actuals)))
         wape = float(np.sum(np.abs(actuals - p50)) / denom * 100.0) if denom else 0.0
         cov = float(np.mean((actuals >= p10) & (actuals <= p90))) * 100.0
+        baseline = series.shift(steps_per_day).reindex(test_df.index).to_numpy()
+        baseline_mae = float(np.mean(np.abs(actuals - baseline)))
+        first_origin = test_df.index.min() - timedelta(days=1)
+        last_origin = test_df.index.max() - timedelta(days=1)
         cal_status = (
             "Split-Conformal Calibrated (80% Nominal Target)" if apply_cal else "Raw Uncalibrated"
         )
@@ -305,7 +370,12 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
             f"| Metric | Result |\n"
             f"|---|---:|\n"
             f"| **Model Strategy** | `{model_type.upper()}` |\n"
+            f"| **Forecast Lead Time** | 24 hours |\n"
+            f"| **Forecast Origins (UTC)** | {first_origin} to {last_origin} |\n"
+            f"| **Latest Training Observation (UTC)** | {history_df.index.max()} |\n"
+            f"| **Lead-Window Actuals** | Displayed for context; excluded from model inputs |\n"
             f"| **Mean Absolute Error (MAE)** | **{mae:.2f} {unit}** |\n"
+            f"| **Previous-Day Baseline MAE** | **{baseline_mae:.2f} {unit}** |\n"
             f"| **Root Mean Squared Error (RMSE)** | **{rmse:.2f} {unit}** |\n"
             f"| **WAPE (Weighted Absolute Percentage Error)** | **{wape:.2f}%** |\n"
             f"| **P10-P90 Empirical Interval Coverage** | **{cov:.1f}%** |\n"
@@ -317,16 +387,18 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
 
         return fig, summary_text, top_importances
 
-    def analytics_interface(country_code: str, target_choice: str) -> go.Figure | None:
+    def analytics_interface(
+        country_code: str, zone_key: str, target_choice: str
+    ) -> go.Figure | None:
         target = EventType.DEMAND if "Demand" in target_choice else EventType.PRICE
         unit = "MW" if target == EventType.DEMAND else "EUR/MWh"
-        series = reader.load_series(
-            target,
-            country_code=country_code,
-            start_year=2024,
-            end_year=2026,
-            resample_freq="60min",
-        )
+        try:
+            series = reader.load_series(
+                target, country_code=country_code, zone_key=zone_key.strip() or None,
+                start_year=2024, end_year=2026, resample_freq="60min",
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise gr.Error(str(exc)) from exc
         if series.empty:
             return None
         return create_seasonality_heatmap(series, target.value.capitalize(), unit)
@@ -349,6 +421,10 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
                             value="ES",
                             label="European Market",
                         )
+                        zone_input = gr.Textbox(
+                            value="", label="Bidding Zone",
+                            info="Required when a country has multiple zones (for example DE_LU)",
+                        )
                         target_radio = gr.Radio(
                             choices=["Electricity Demand (MW)", "Day-Ahead Price (EUR/MWh)"],
                             value="Electricity Demand (MW)",
@@ -356,11 +432,11 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
                         )
                         model_dropdown = gr.Dropdown(
                             choices=[(label, code) for label, code in MODEL_CHOICES],
-                            value="dual_horizon",
+                            value="lightgbm",
                             label="Model Strategy",
                         )
                         date_input = gr.Textbox(
-                            value="2026-06-15",
+                            value="2025-02-20",
                             label="Evaluation Date (YYYY-MM-DD)",
                             info="Select an out-of-sample date (e.g. 2024 to 2026)",
                         )
@@ -375,7 +451,7 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
                         cal_check = gr.Checkbox(
                             value=True,
                             label="Apply Conformal Calibration (80% Interval)",
-                            info="Ensures well-calibrated prediction bounds",
+                            info="Apply interval calibration fitted on later training data",
                         )
                         predict_btn = gr.Button("Generate Forecast", variant="primary")
 
@@ -388,6 +464,7 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
                     fn=forecast_interface,
                     inputs=[
                         country_dropdown,
+                        zone_input,
                         target_radio,
                         model_dropdown,
                         date_input,
@@ -405,6 +482,10 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
                             value="ES",
                             label="European Market",
                         )
+                        ana_zone = gr.Textbox(
+                            value="", label="Bidding Zone",
+                            info="Required when a country has multiple zones",
+                        )
                         ana_target = gr.Radio(
                             choices=["Electricity Demand (MW)", "Day-Ahead Price (EUR/MWh)"],
                             value="Electricity Demand (MW)",
@@ -416,7 +497,7 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
 
                 ana_btn.click(
                     fn=analytics_interface,
-                    inputs=[ana_country, ana_target],
+                    inputs=[ana_country, ana_zone, ana_target],
                     outputs=[heatmap_output],
                 )
 
@@ -434,11 +515,11 @@ def build_gradio_app(data_dir: Path = DEFAULT_DATASET_PATH) -> Any:
                          short-term to long-term forecaster across lead time steps.
 
                     2. **Stacked Multi-Model Ensemble (`stacked`)**:
-                       - Blends LightGBM, XGBoost, and CatBoost with optimal weights.
+                       - Blends LightGBM, XGBoost, and CatBoost with fixed weights.
 
                     3. **Split-Conformal Prediction Calibration**:
-                       - Non-conformity calibration ensures that the empirical coverage of the
-                         P10-P90 envelope matches the nominal 80.0% confidence target.
+                       - Calibration targets 80% P10-P90 coverage. Measured coverage is
+                         displayed with each evaluation.
                     """
                 )
 

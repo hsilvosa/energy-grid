@@ -7,16 +7,18 @@ from pathlib import Path
 from typing import Annotated
 
 import numpy as np
+import pandas as pd
 import typer
 
 from energy_grid.backtest import run_rolling_backtest
 from energy_grid.config import get_settings
 from energy_grid.domain import EventType
-from energy_grid.features import build_multiscale_features
-from energy_grid.forecasting import evaluate, materialize_demo_forecasts
+from energy_grid.features import build_horizon_features
+from energy_grid.forecasting import evaluate, materialize_demo_forecasts, synthetic_training_data
 from energy_grid.hf_hub import export_model_to_hf_package, upload_model_to_hf
-from energy_grid.live_service import run_live_pipeline
+from energy_grid.live_service import run_live_inference, run_live_pipeline
 from energy_grid.monitoring import EVENTS_PUBLISHED
+from energy_grid.release import rollback_model_deployment
 from energy_grid.replay import KafkaProducerAdapter, ReplayProfile, load_fixture
 from energy_grid.replay import replay as replay_events
 from energy_grid.rollback import RollbackController, RollbackState
@@ -24,6 +26,25 @@ from energy_grid.sources.dataset_reader import DEFAULT_DATASET_PATH, EntsoeDatas
 from energy_grid.storage import ForecastStore
 
 app = typer.Typer(no_args_is_help=True)
+
+
+@app.command("create-sample-data")
+def create_sample_data(
+    output_dir: Annotated[Path, typer.Option()] = Path("data/runtime/sample"),
+) -> None:
+    """Create a small synthetic ES dataset for the interactive demo."""
+    frame = synthetic_training_data(days=60)
+    common = {
+        "timestamp_utc": frame["valid_time"],
+        "country_code": "ES", "zone_key": "ES", "zone_name": "Synthetic Spain",
+    }
+    demand = pd.DataFrame({**common, "load": frame["demand"]})
+    price = pd.DataFrame({**common, "price": frame["price"]}).iloc[::4]
+    for name, table in (("actual_load", demand), ("day_ahead_prices", price)):
+        destination = output_dir / name
+        destination.mkdir(parents=True, exist_ok=True)
+        table.to_parquet(destination / "sample.parquet", index=False)
+    typer.echo(f"Wrote synthetic ES demand and price data to {output_dir}")
 
 
 @app.command()
@@ -194,20 +215,62 @@ def live_demo(
         f"kafka_events={summary.kafka_events}"
     )
     for result in (summary.demand_result, summary.price_result):
+        release = summary.releases[result.target.value]
         typer.echo(
             f"{result.target.value}: forecasts={len(result.forecasts)}, "
             f"training_rows={result.training_rows}, "
             f"mae={result.metrics.mae:.3f}, baseline_mae={result.baseline_mae:.3f}, "
-            f"snapshot={result.snapshot_id}"
+            f"release={'promoted' if release.promoted else 'rejected'} "
+            f"({release.reason}), snapshot={result.snapshot_id}"
         )
     if summary.mlflow_run_ids:
         typer.echo(f"MLflow runs: {summary.mlflow_run_ids}")
+
+
+@app.command("live-inference")
+def live_inference(
+    history_days: Annotated[int, typer.Option(min=8, max=60)] = 15,
+    target: Annotated[EventType | None, typer.Option()] = None,
+) -> None:
+    """Generate forecasts using approved model artifacts without retraining."""
+    if target not in (None, EventType.DEMAND, EventType.PRICE):
+        raise typer.BadParameter("target must be demand or price")
+    targets = (target,) if target else (EventType.DEMAND, EventType.PRICE)
+    summary = run_live_inference(
+        get_settings(), history_days=history_days, targets=targets
+    )
+    typer.echo(
+        f"Inference complete: forecasts={summary.forecasts_written}, "
+        f"demand_events={summary.demand_events}, price_events={summary.price_events}, "
+        f"weather_events={summary.weather_events}"
+    )
+
+
+@app.command("rollback-model")
+def rollback_model(
+    target: Annotated[EventType, typer.Option()],
+    area: Annotated[str, typer.Option()] = "10YES-REE------0",
+    forecast_product: Annotated[str, typer.Option()] = "operational",
+) -> None:
+    """Restore the previous approved artifact for one deployed forecast product."""
+    if target not in (EventType.DEMAND, EventType.PRICE):
+        raise typer.BadParameter("target must be demand or price")
+    store = ForecastStore(get_settings().database_url)
+    store.create_schema()
+    rollback_model_deployment(
+        store,
+        area=area,
+        target=target,
+        forecast_product=forecast_product,
+    )
+    typer.echo(f"Rolled back {area}/{target.value}/{forecast_product}")
 
 
 @app.command("summarize-dataset")
 def summarize_dataset(
     data_dir: Annotated[Path, typer.Option()] = DEFAULT_DATASET_PATH,
     country_code: Annotated[str, typer.Option()] = "ES",
+    zone_key: Annotated[str | None, typer.Option()] = None,
 ) -> None:
     """Inspect and summarize local parquet datasets in data_dir."""
     reader = EntsoeDatasetReader(data_dir)
@@ -217,7 +280,7 @@ def summarize_dataset(
 
     for target in (EventType.DEMAND, EventType.PRICE):
         try:
-            summary = reader.summarize(target, country_code=country_code)
+            summary = reader.summarize(target, country_code=country_code, zone_key=zone_key)
             typer.echo(
                 f"[{summary.dataset_type.upper()}] {summary.country_code} ({summary.zone_key}): "
                 f"{summary.total_records:,} records from "
@@ -241,6 +304,7 @@ def train_historical(
     start_year: Annotated[int, typer.Option()] = 2022,
     end_year: Annotated[int, typer.Option()] = 2026,
     calibrate: Annotated[bool, typer.Option()] = True,
+    horizon_hours: Annotated[int, typer.Option(help="Forecast lead time in hours")] = 24,
     output_model_dir: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Train quantile forecaster on multi-year dataset."""
@@ -265,20 +329,37 @@ def train_historical(
 
     steps_per_day = 96 if target == EventType.DEMAND else 24
     typer.echo(f"Constructing multiscale features for {len(series):,} observations...")
-    df = build_multiscale_features(series, steps_per_day=steps_per_day)
+    if horizon_hours < 1:
+        raise typer.BadParameter("horizon-hours must be positive")
+    lead = horizon_hours * steps_per_day // 24
+    df = build_horizon_features(
+        series, horizon_steps=lead, steps_per_day=steps_per_day, country_code=country_code
+    )
     feature_names = [col for col in df.columns if col != "target"]
 
     # Holdout validation (last 20%)
     holdout_size = int(len(df) * 0.20)
-    train_df = df.iloc[:-holdout_size]
+    train_df = df.iloc[: -holdout_size - lead]
     val_df = df.iloc[-holdout_size:]
+    if train_df.empty:
+        raise typer.BadParameter("not enough history for the requested horizon")
+    if model_type == "dual_horizon":
+        short_df = build_horizon_features(
+            series, horizon_steps=1, steps_per_day=steps_per_day, country_code=country_code
+        )
+        short_df = short_df[short_df.index <= train_df.index.max()]
+        train_df = pd.concat([train_df, short_df]).sort_index(kind="stable")
 
     typer.echo(
         f"Training {model_type.upper()} on {len(train_df):,} rows, "
         f"validating on {len(val_df):,} rows "
         f"({val_df.index.min().date()} to {val_df.index.max().date()})..."
     )
-    model = create_forecaster(model_type)  # type: ignore[arg-type]
+    model_options = (
+        {"switch_horizon_steps": 6 * steps_per_day // 24}
+        if model_type == "dual_horizon" else {}
+    )
+    model = create_forecaster(model_type, **model_options)  # type: ignore[arg-type]
     model.fit(
         train_df,
         train_df["target"],
@@ -293,7 +374,7 @@ def train_historical(
     metrics = evaluate(
         actuals, cal_p50, cal_p10, cal_p90, allow_wape=target == EventType.DEMAND
     )
-    base_7d = val_df["lag_7d"].to_numpy()
+    base_7d = series.shift(max(lead, steps_per_day * 7)).reindex(val_df.index).to_numpy()
     b7d_metrics = evaluate(
         actuals, base_7d, base_7d, base_7d, allow_wape=target == EventType.DEMAND
     )
@@ -327,6 +408,7 @@ def backtest(
     end_year: Annotated[int, typer.Option()] = 2026,
     train_days: Annotated[int, typer.Option()] = 365,
     test_days: Annotated[int, typer.Option()] = 30,
+    horizon_hours: Annotated[int, typer.Option(help="Forecast lead time in hours")] = 24,
     output_report: Annotated[Path | None, typer.Option()] = None,
     output_json: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
@@ -345,6 +427,8 @@ def backtest(
         raise typer.Exit(code=1)
 
     steps_per_day = 96 if target == EventType.DEMAND else 24
+    if horizon_hours < 1:
+        raise typer.BadParameter("horizon-hours must be positive")
     typer.echo(f"Running rolling-origin backtest on {len(series):,} observations...")
     report = run_rolling_backtest(
         series,
@@ -353,6 +437,8 @@ def backtest(
         test_days=test_days,
         step_days=test_days,
         steps_per_day=steps_per_day,
+        horizon_steps=horizon_hours * steps_per_day // 24,
+        country_code=country_code,
     )
 
     typer.echo(report.to_markdown())
@@ -394,14 +480,20 @@ def export_hf(
     country_code: Annotated[str, typer.Option()] = "ES",
     zone_key: Annotated[str | None, typer.Option()] = None,
     model_type: Annotated[
-        str, typer.Option(help="lightgbm, xgboost, catboost, stacked, dual_horizon")
-    ] = "dual_horizon",
+        str, typer.Option(help="lightgbm (the portable model package format)")
+    ] = "lightgbm",
     start_year: Annotated[int, typer.Option()] = 2022,
     end_year: Annotated[int, typer.Option()] = 2026,
+    horizon_hours: Annotated[int, typer.Option(help="Forecast lead time in hours")] = 24,
     output_dir: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Train and export a production-ready model repository for Hugging Face."""
     from energy_grid.forecasting import create_forecaster
+
+    if model_type != "lightgbm":
+        raise typer.BadParameter("portable export currently supports lightgbm only")
+    if horizon_hours < 1:
+        raise typer.BadParameter("horizon-hours must be positive")
 
     reader = EntsoeDatasetReader(data_dir)
     target_name = f"{country_code.lower()}-{target.value}-forecaster"
@@ -421,12 +513,17 @@ def export_hf(
         resample_freq="15min" if target == EventType.DEMAND else "60min",
     )
     steps_per_day = 96 if target == EventType.DEMAND else 24
-    df = build_multiscale_features(series, steps_per_day=steps_per_day)
+    lead = horizon_hours * steps_per_day // 24
+    df = build_horizon_features(
+        series, horizon_steps=lead, steps_per_day=steps_per_day, country_code=country_code
+    )
     feature_names = [col for col in df.columns if col != "target"]
 
     holdout_size = int(len(df) * 0.20)
-    train_df = df.iloc[:-holdout_size]
+    train_df = df.iloc[: -holdout_size - lead]
     val_df = df.iloc[-holdout_size:]
+    if train_df.empty:
+        raise typer.BadParameter("not enough history for the requested horizon")
 
     model = create_forecaster(model_type)  # type: ignore[arg-type]
     model.fit(
@@ -436,7 +533,7 @@ def export_hf(
     p10, p50, p90 = model.predict(val_df, apply_calibration=True)
     actuals = val_df["target"].to_numpy()
     metrics = evaluate(actuals, p50, p10, p90, allow_wape=target == EventType.DEMAND)
-    base_7d = val_df["lag_7d"].to_numpy()
+    base_7d = series.shift(max(lead, steps_per_day * 7)).reindex(val_df.index).to_numpy()
     b7d_metrics = evaluate(
         actuals, base_7d, base_7d, base_7d, allow_wape=target == EventType.DEMAND
     )

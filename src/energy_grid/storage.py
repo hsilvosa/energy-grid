@@ -64,6 +64,29 @@ class ModelStatusRow(Base):
     status: Mapped[str] = mapped_column(String(32), default="healthy")
 
 
+class ModelDeploymentRow(Base):
+    """Release state for one independently deployed forecasting product."""
+
+    __tablename__ = "model_deployments"
+
+    deployment_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    area: Mapped[str] = mapped_column(String(32), index=True)
+    target: Mapped[str] = mapped_column(String(32), index=True)
+    forecast_product: Mapped[str] = mapped_column(String(64), index=True)
+    champion_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    champion_artifact_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    previous_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    previous_artifact_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    previous_error: Mapped[float | None] = mapped_column(Float, nullable=True)
+    candidate_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_artifact_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    champion_error: Mapped[float | None] = mapped_column(Float, nullable=True)
+    candidate_error: Mapped[float | None] = mapped_column(Float, nullable=True)
+    baseline_error: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), default="candidate")
+
+
 class BackfillManifestRow(Base):
     __tablename__ = "backfill_manifests"
 
@@ -187,6 +210,81 @@ class ForecastStore:
                 }
                 for row in rows
             ]
+
+    @staticmethod
+    def _deployment_key(area: str, target: EventType, forecast_product: str) -> str:
+        return f"{area}:{target.value}:{forecast_product}"
+
+    def get_model_deployment(
+        self, *, area: str, target: EventType, forecast_product: str
+    ) -> dict[str, Any] | None:
+        key = self._deployment_key(area, target, forecast_product)
+        with Session(self.engine) as session:
+            row = session.get(ModelDeploymentRow, key)
+            if row is None:
+                return None
+            return {
+                "deployment_key": row.deployment_key,
+                "area": row.area,
+                "target": row.target,
+                "forecast_product": row.forecast_product,
+                "champion_version": row.champion_version,
+                "champion_artifact_uri": row.champion_artifact_uri,
+                "previous_version": row.previous_version,
+                "previous_artifact_uri": row.previous_artifact_uri,
+                "previous_error": row.previous_error,
+                "candidate_version": row.candidate_version,
+                "candidate_artifact_uri": row.candidate_artifact_uri,
+                "champion_error": row.champion_error,
+                "candidate_error": row.candidate_error,
+                "baseline_error": row.baseline_error,
+                "last_evaluated_at": row.last_evaluated_at,
+                "status": row.status,
+            }
+
+    def set_model_deployment(
+        self, *, area: str, target: EventType, forecast_product: str, **values: Any
+    ) -> None:
+        key = self._deployment_key(area, target, forecast_product)
+        with Session(self.engine) as session:
+            row = session.get(ModelDeploymentRow, key)
+            if row is None:
+                row = ModelDeploymentRow(
+                    deployment_key=key,
+                    area=area,
+                    target=target.value,
+                    forecast_product=forecast_product,
+                    **values,
+                )
+                session.add(row)
+            else:
+                for name, value in values.items():
+                    if not hasattr(row, name):
+                        raise ValueError(f"unknown deployment field: {name}")
+                    setattr(row, name, value)
+            session.commit()
+
+    def model_deployments(self) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            rows = session.query(ModelDeploymentRow).order_by(
+                ModelDeploymentRow.area,
+                ModelDeploymentRow.target,
+                ModelDeploymentRow.forecast_product,
+            ).all()
+            identities = [
+                (row.area, EventType(row.target), row.forecast_product)
+                for row in rows
+            ]
+        deployments: list[dict[str, Any]] = []
+        for area, target, forecast_product in identities:
+            deployment = self.get_model_deployment(
+                area=area,
+                target=target,
+                forecast_product=forecast_product,
+            )
+            if deployment is not None:
+                deployments.append(deployment)
+        return deployments
 
     def set_model_status(self, target: EventType, **values: Any) -> None:
         with Session(self.engine) as session:

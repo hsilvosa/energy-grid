@@ -110,7 +110,7 @@ model-index:
 High-accuracy calibrated quantile LightGBM model for forecasting {c_name} **{target.value}**.
 Resolution: {resolution}. Trained on multi-year data ({start_year}–{end_year}) from **ENTSO-E**,
 featuring multi-scale lags, cyclical encodings, and **conformal calibration**
-for well-calibrated 80% prediction intervals ($P10, P50, P90$).
+for prediction intervals targeting 80% coverage ($P10, P50, P90$).
 
 ## Model Highlights
 

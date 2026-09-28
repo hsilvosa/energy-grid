@@ -1,9 +1,26 @@
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 
 from energy_grid.domain import MADRID
+
+MARKET_TIMEZONES = {
+    "ES": "Europe/Madrid", "PT": "Europe/Lisbon", "FR": "Europe/Paris",
+    "DE": "Europe/Berlin", "IT": "Europe/Rome", "NL": "Europe/Amsterdam",
+    "BE": "Europe/Brussels", "PL": "Europe/Warsaw", "AT": "Europe/Vienna",
+    "NO": "Europe/Oslo", "SE": "Europe/Stockholm", "GR": "Europe/Athens",
+    "CH": "Europe/Zurich", "GB": "Europe/London", "FI": "Europe/Helsinki",
+    "AL": "Europe/Tirane", "BA": "Europe/Sarajevo", "BG": "Europe/Sofia",
+    "CY": "Asia/Nicosia", "CZ": "Europe/Prague", "DK": "Europe/Copenhagen",
+    "EE": "Europe/Tallinn", "HR": "Europe/Zagreb", "HU": "Europe/Budapest",
+    "IE": "Europe/Dublin", "LT": "Europe/Vilnius", "LU": "Europe/Luxembourg",
+    "LV": "Europe/Riga", "ME": "Europe/Podgorica", "MK": "Europe/Skopje",
+    "RO": "Europe/Bucharest", "RS": "Europe/Belgrade", "SI": "Europe/Ljubljana",
+    "SK": "Europe/Bratislava", "XK": "Europe/Belgrade",
+}
 
 FEATURE_COLUMNS_CORE = [
     "hour",
@@ -147,22 +164,43 @@ def asof_features(
     if (result["published_at"] > result["forecast_origin"]).fillna(False).any():
         raise AssertionError("future-published values leaked into features")
     result["is_missing"] = result[value_column].isna()
-    result["imputation_method"] = result["is_missing"].map({True: "seasonal_median", False: "none"})
-    result[value_column] = result[value_column].fillna(right[value_column].tail(96 * 7).median())
+    # A global fallback would use values published after some forecast origins.
+    prior = right[["published_at", value_column]].dropna(subset=[value_column]).copy()
+    prior = prior.sort_values("published_at")
+    prior["prior_median"] = prior[value_column].expanding().median()
+    fallback = pd.merge_asof(
+        left[["forecast_origin"]],
+        prior[["published_at", "prior_median"]],
+        left_on="forecast_origin", right_on="published_at", direction="backward",
+    )["prior_median"]
+    result[value_column] = result[value_column].fillna(fallback)
+    result["imputation_method"] = np.where(
+        ~result["is_missing"], "none",
+        np.where(result[value_column].notna(), "prior_median", "unavailable"),
+    )
     return result
 
 
-def calendar_features(frame: pd.DataFrame, column: str = "valid_time") -> pd.DataFrame:
+def calendar_features(
+    frame: pd.DataFrame, column: str = "valid_time", *, country_code: str = "ES"
+) -> pd.DataFrame:
     """Derive calendar, peak, and cyclical time features from datetime column."""
     result = frame.copy()
-    timestamps = pd.to_datetime(result[column], utc=True).dt.tz_convert(MADRID)
+    try:
+        timezone = ZoneInfo(MARKET_TIMEZONES[country_code.upper()])
+    except KeyError as exc:
+        raise ValueError(f"unsupported country_code: {country_code}") from exc
+    timestamps = pd.to_datetime(result[column], utc=True).dt.tz_convert(timezone)
     result["hour"] = timestamps.dt.hour
     result["quarter"] = timestamps.dt.minute // 15
     result["day_of_week"] = timestamps.dt.dayofweek
     result["day_of_year"] = timestamps.dt.dayofyear
     result["month"] = timestamps.dt.month
     result["is_weekend"] = (timestamps.dt.dayofweek >= 5).astype(int)
-    result["is_holiday"] = is_spanish_holiday(timestamps.dt.tz_convert("UTC")).values
+    result["is_holiday"] = (
+        is_spanish_holiday(timestamps.dt.tz_convert("UTC")).values
+        if country_code.upper() == "ES" else 0
+    )
 
     # Peak hour indicators (Morning: 8-11h, Evening: 19-22h)
     result["is_morning_peak"] = ((result["hour"] >= 8) & (result["hour"] <= 11)).astype(int)
@@ -238,10 +276,11 @@ def build_multiscale_features(
     steps_per_day: int = 96,
     additional_exog: pd.DataFrame | None = None,
     exogenous_series: pd.Series | None = None,
+    country_code: str = "ES",
 ) -> pd.DataFrame:
     """Build unified multi-scale feature matrix from continuous time-series."""
     df = pd.DataFrame({"valid_time": series.index, "target": series.values})
-    df = calendar_features(df, column="valid_time")
+    df = calendar_features(df, column="valid_time", country_code=country_code)
     df = lag_features(df, value_column="target", steps_per_day=steps_per_day)
 
     if exogenous_series is not None:
@@ -259,7 +298,39 @@ def build_multiscale_features(
     df = df.set_index("valid_time")
     # Drop rows where long-term lags are NaN
     df = df.dropna()
+    df["horizon_step"] = 1
     return df
+
+
+def build_horizon_features(
+    series: pd.Series, *, horizon_steps: int, steps_per_day: int = 96,
+    country_code: str = "ES",
+) -> pd.DataFrame:
+    """Create features for a valid time using observations available at its forecast origin.
+
+    The origin is ``horizon_steps`` intervals before the target. Historical
+    statistics are shifted so their newest observation is at or before the origin.
+    """
+    if horizon_steps < 1 or steps_per_day < 24 or steps_per_day % 24:
+        raise ValueError("horizon_steps must be positive and steps_per_day divisible by 24")
+    if not isinstance(series.index, pd.DatetimeIndex) or series.index.tz is None:
+        raise ValueError("series must have a timezone-aware DatetimeIndex")
+    if series.isna().any():
+        raise ValueError("series contains missing observations; repair gaps before backtesting")
+    expected = pd.Timedelta(days=1) / steps_per_day
+    if not series.index.is_monotonic_increasing or not series.index.is_unique or not (
+        series.index.to_series().diff().iloc[1:] == expected
+    ).all():
+        raise ValueError("series must have a regular, unique time index")
+
+    frame = pd.DataFrame({"valid_time": series.index, "target": series.to_numpy()})
+    calendar = calendar_features(frame[["valid_time"]], country_code=country_code)
+    historical = lag_features(frame, "target", steps_per_day=steps_per_day)
+    historical = historical.drop(columns=["valid_time", "target"]).shift(horizon_steps - 1)
+    result = pd.concat([calendar, historical], axis=1).set_index("valid_time")
+    result["horizon_step"] = horizon_steps
+    result["target"] = series.to_numpy()
+    return result.dropna()
 
 
 def build_short_horizon_features(

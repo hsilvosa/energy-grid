@@ -112,6 +112,14 @@ class EntsoeDatasetReader:
             )
             return frame
 
+        if zone_key is None and "zone_key" in frame:
+            zones = frame["zone_key"].dropna().unique()
+            if len(zones) > 1:
+                raise ValueError(
+                    f"Country {country_code} has multiple bidding zones; "
+                    f"specify zone_key from {sorted(map(str, zones))}"
+                )
+
         # Ensure UTC timezone and proper timestamp sorting
         if not isinstance(frame["timestamp_utc"].dtype, pd.DatetimeTZDtype):
             frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True)
@@ -157,8 +165,8 @@ class EntsoeDatasetReader:
         series.index = pd.DatetimeIndex(series.index).tz_convert("UTC")
 
         if resample_freq:
-            # Resample and interpolate small missing gaps linearly
-            series = series.resample(resample_freq).mean().interpolate(method="time", limit=4)
+            # Forward fill small gaps; linear interpolation would use future observations.
+            series = series.resample(resample_freq).mean().ffill(limit=4)
 
         return series
 
@@ -277,4 +285,3 @@ class EntsoeDatasetReader:
             max_value=float(np.nanmax(series)),
             mean_value=float(np.nanmean(series)),
         )
-

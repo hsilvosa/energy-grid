@@ -139,7 +139,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/models/status")
     def model_status(store: Annotated[ForecastStore, Depends(get_store)]) -> dict[str, Any]:
-        return {"models": store.model_statuses()}
+        return {
+            "models": store.model_statuses(),
+            "deployments": store.model_deployments(),
+        }
 
     return app
 

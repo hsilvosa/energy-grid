@@ -14,7 +14,8 @@ COPY src ./src
 COPY data/fixtures ./data/fixtures
 RUN pip install --upgrade pip && pip install ".[streaming]"
 
-RUN addgroup --system energy && adduser --system --ingroup energy energy \
+RUN addgroup --system --gid 10001 energy \
+    && adduser --system --uid 10001 --ingroup energy energy \
     && mkdir -p /app/data/runtime && chown -R energy:energy /app
 USER energy
 

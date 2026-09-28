@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import pytest
 
 from energy_grid.backtest import run_rolling_backtest
 from energy_grid.domain import EventType
@@ -42,21 +44,47 @@ def test_forecasting_and_calibration() -> None:
     assert metrics.interval_coverage >= 0.0
 
 
-def test_dataset_reader_and_backtest() -> None:
-    reader = EntsoeDatasetReader(Path(r"D:\datasets\entsoe-transparency"))
+def test_dataset_reader(tmp_path: Path) -> None:
+    sample = synthetic_training_data(days=15)
+    parquet_dir = tmp_path / "actual_load"
+    parquet_dir.mkdir()
+    sample["country_code"] = "ES"
+    sample["zone_key"] = "ES"
+    sample["timestamp_utc"] = sample["valid_time"]
+    sample["load"] = sample["demand"]
+    sample.to_parquet(parquet_dir / "sample.parquet")
+    reader = EntsoeDatasetReader(tmp_path)
     assert reader.exists()
 
     series = reader.load_series(
         EventType.DEMAND,
         country_code="ES",
-        start_year=2024,
-        end_year=2024,
-        start_time=datetime(2024, 1, 1, tzinfo=UTC),
-        end_time=datetime(2024, 1, 15, tzinfo=UTC),
+        start_year=2025,
+        end_year=2025,
+        start_time=datetime(2025, 1, 1, tzinfo=UTC),
+        end_time=datetime(2025, 1, 15, tzinfo=UTC),
     )
     assert not series.empty
     assert len(series) > 100
 
+
+def test_dataset_reader_requires_zone_for_multi_zone_country(tmp_path: Path) -> None:
+    sample = synthetic_training_data(days=1)
+    parquet_dir = tmp_path / "actual_load"
+    parquet_dir.mkdir()
+    rows = []
+    for zone in ("DE", "DE_LU"):
+        rows.append(pd.DataFrame({
+            "timestamp_utc": sample["valid_time"], "country_code": "DE",
+            "zone_key": zone, "load": sample["demand"],
+        }))
+    pd.concat(rows).to_parquet(parquet_dir / "sample.parquet", index=False)
+    reader = EntsoeDatasetReader(tmp_path)
+    with pytest.raises(ValueError, match="multiple bidding zones"):
+        reader.load_series(EventType.DEMAND, country_code="DE")
+
+
+def test_backtest_on_synthetic_series() -> None:
     # Backtest on synthetic series
     df = synthetic_training_data(days=60)
     rep = run_rolling_backtest(
@@ -109,4 +137,3 @@ def test_hf_export_and_forecaster_api(tmp_path: Path) -> None:
     assert "point_forecast" in preds.columns
     assert "p10" in preds.columns
     assert "p90" in preds.columns
-

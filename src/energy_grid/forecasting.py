@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from energy_grid.domain import MADRID, EventType, ForecastRecord
+from energy_grid.features import LONG_HORIZON_FEATURES, SHORT_HORIZON_FEATURES
 from energy_grid.time_utils import delivery_intervals, floor_quarter_hour
 
 
@@ -224,7 +225,7 @@ class LightGBMQuantileForecaster:
                 y_cal.to_numpy(), stacked[0], stacked[2]
             )
 
-        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
         return self
 
     def predict(
@@ -372,7 +373,7 @@ class XGBoostQuantileForecaster:
                 y_cal.to_numpy(), stacked[0], stacked[2]
             )
 
-        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
         return self
 
     def predict(
@@ -469,7 +470,7 @@ class CatBoostQuantileForecaster:
                 y_cal.to_numpy(), stacked[0], stacked[2]
             )
 
-        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
         return self
 
     def predict(
@@ -528,16 +529,39 @@ class StackedQuantileEnsemble:
         calibration_fraction: float = 0.15,
     ) -> StackedQuantileEnsemble:
         self.feature_names = list(feature_names)
+        if not 0 <= calibration_fraction < 1:
+            raise ValueError("calibration_fraction must be in [0, 1)")
+        if not features.index.is_monotonic_increasing:
+            raise ValueError("ensemble training rows must be ordered by valid time")
+        cal_periods = (
+            max(1, int(features.index.nunique() * calibration_fraction))
+            if calibration_fraction else 0
+        )
+        if cal_periods:
+            cal_start = features.index.unique()[-cal_periods]
+            fit_mask = features.index < cal_start
+            cal_mask = ~fit_mask
+            fit_features = features.loc[fit_mask]
+            fit_target = target.loc[fit_mask]
+        else:
+            fit_features, fit_target = features, target
+        if fit_features.empty:
+            raise ValueError("not enough rows before calibration split")
         self.lgbm.fit(
-            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+            fit_features, fit_target, feature_names=feature_names, calibration_fraction=0
         )
         self.xgb.fit(
-            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+            fit_features, fit_target, feature_names=feature_names, calibration_fraction=0
         )
         self.cat.fit(
-            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+            fit_features, fit_target, feature_names=feature_names, calibration_fraction=0
         )
-        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        if cal_periods:
+            p10, _, p90 = self.predict(features.loc[cal_mask], apply_calibration=False)
+            self.calibrator = ConformalCalibrator().fit(
+                target.loc[cal_mask].to_numpy(), p10, p90
+            )
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
         return self
 
     def predict(
@@ -558,8 +582,8 @@ class StackedQuantileEnsemble:
         stacked = np.sort(np.vstack([p10, p50, p90]), axis=0)
         p10, p50, p90 = stacked[0], stacked[1], stacked[2]
 
-        if apply_calibration and self.lgbm.calibrator and self.lgbm.calibrator.is_fitted:
-            p10, p90 = self.lgbm.calibrator.calibrate(p10, p90)
+        if apply_calibration and self.calibrator is not None:
+            p10, p90 = self.calibrator.calibrate(p10, p90)
             stacked_cal = np.sort(np.vstack([p10, p50, p90]), axis=0)
             p10, p50, p90 = stacked_cal[0], stacked_cal[1], stacked_cal[2]
 
@@ -591,6 +615,7 @@ class DualHorizonEnsembleForecaster:
         self.switch_horizon_steps = switch_horizon_steps
         self.short_model = LightGBMQuantileForecaster(n_estimators=180, learning_rate=0.04)
         self.long_model = LightGBMQuantileForecaster(n_estimators=240, learning_rate=0.04)
+        self.calibrator: ConformalCalibrator | None = None
         self.feature_names: list[str] = []
 
     def fit(
@@ -602,13 +627,50 @@ class DualHorizonEnsembleForecaster:
         calibration_fraction: float = 0.15,
     ) -> DualHorizonEnsembleForecaster:
         self.feature_names = list(feature_names)
+        if "horizon_step" not in features:
+            raise ValueError("dual-horizon forecasts require a horizon_step column")
+        if not 0 <= calibration_fraction < 1:
+            raise ValueError("calibration_fraction must be in [0, 1)")
+        if not features.index.is_monotonic_increasing:
+            raise ValueError("dual-horizon training rows must be ordered by valid time")
+        cal_periods = (
+            max(1, int(features.index.nunique() * calibration_fraction))
+            if calibration_fraction else 0
+        )
+        if cal_periods:
+            cal_start = features.index.unique()[-cal_periods]
+            fit_mask = features.index < cal_start
+            cal_mask = ~fit_mask
+            fit_features = features.loc[fit_mask]
+            fit_target = target.loc[fit_mask]
+        else:
+            fit_features, fit_target = features, target
+        if fit_features.empty:
+            raise ValueError("not enough rows before calibration split")
+        short_features = [name for name in SHORT_HORIZON_FEATURES if name in feature_names]
+        long_features = [name for name in LONG_HORIZON_FEATURES if name in feature_names]
+        if not short_features or not long_features:
+            raise ValueError("short and long horizon feature sets must both be available")
+        short_mask = fit_features["horizon_step"] <= self.switch_horizon_steps
+        long_mask = fit_features["horizon_step"] >= self.switch_horizon_steps
+        short_train = fit_features.loc[short_mask] if short_mask.any() else fit_features
+        long_train = fit_features.loc[long_mask] if long_mask.any() else fit_features
+        short_target = fit_target.loc[short_mask] if short_mask.any() else fit_target
+        long_target = fit_target.loc[long_mask] if long_mask.any() else fit_target
         self.short_model.fit(
-            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+            short_train, short_target,
+            feature_names=short_features, calibration_fraction=0,
         )
         self.long_model.fit(
-            features, target, feature_names=feature_names, calibration_fraction=calibration_fraction
+            long_train, long_target,
+            feature_names=long_features, calibration_fraction=0,
         )
-        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        if cal_periods:
+            p10, _, p90 = self.predict(features.loc[cal_mask], apply_calibration=False)
+            self.calibrator = ConformalCalibrator().fit(
+                target.loc[cal_mask].to_numpy(), p10, p90
+            )
+        self.model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
         return self
 
     def predict(
@@ -618,14 +680,12 @@ class DualHorizonEnsembleForecaster:
         apply_calibration: bool = True,
     ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
         """Predict with dynamic decay from short-horizon to long-horizon model."""
-        p10_s, p50_s, p90_s = self.short_model.predict(
-            features, apply_calibration=apply_calibration
-        )
-        p10_l, p50_l, p90_l = self.long_model.predict(features, apply_calibration=apply_calibration)
+        if "horizon_step" not in features:
+            raise ValueError("dual-horizon forecasts require a horizon_step column")
+        p10_s, p50_s, p90_s = self.short_model.predict(features, apply_calibration=False)
+        p10_l, p50_l, p90_l = self.long_model.predict(features, apply_calibration=False)
 
-        n = len(features)
-        # Decay factor: step 1 is short-term, transitions smoothly to long-term
-        steps = np.arange(n)
+        steps = features["horizon_step"].to_numpy(dtype=float) - 1.0
         alpha = np.maximum(0.0, 1.0 - (steps / float(self.switch_horizon_steps)))
         alpha = np.clip(alpha, 0.0, 1.0)
 
@@ -634,6 +694,9 @@ class DualHorizonEnsembleForecaster:
         p90 = alpha * p90_s + (1.0 - alpha) * p90_l
 
         stacked = np.sort(np.vstack([p10, p50, p90]), axis=0)
+        if apply_calibration and self.calibrator is not None:
+            low, high = self.calibrator.calibrate(stacked[0], stacked[2])
+            stacked = np.sort(np.vstack([low, stacked[1], high]), axis=0)
         return stacked[0], stacked[1], stacked[2]
 
     def get_feature_importances(self) -> dict[str, float]:

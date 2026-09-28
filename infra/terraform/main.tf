@@ -3,10 +3,12 @@ data "aws_availability_zones" "available" {
 }
 
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 
 locals {
-  name           = "${var.project_name}-${var.environment}"
-  runtime_enabled = var.api_image != "" && var.certificate_arn != ""
+  name                       = "${var.project_name}-${var.environment}"
+  runtime_enabled            = var.api_image != "" && var.certificate_arn != ""
+  task_definition_family_arn = "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${local.name}-api"
   tags = {
     Project     = var.project_name
     Environment = var.environment
@@ -40,7 +42,7 @@ resource "aws_subnet" "data" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index + 10)
   availability_zone = data.aws_availability_zones.available.names[count.index]
-  tags               = { Name = "${local.name}-data-${count.index + 1}" }
+  tags              = { Name = "${local.name}-data-${count.index + 1}" }
 }
 
 resource "aws_route_table" "public" {
@@ -117,7 +119,11 @@ resource "aws_s3_bucket_versioning" "lakehouse" {
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "lakehouse" {
   bucket = aws_s3_bucket.lakehouse.id
-  rule { apply_server_side_encryption_by_default { sse_algorithm = "AES256" } }
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
 }
 
 resource "aws_s3_bucket_public_access_block" "lakehouse" {
@@ -194,7 +200,13 @@ resource "aws_msk_serverless_cluster" "main" {
     subnet_ids         = aws_subnet.data[*].id
     security_group_ids = [aws_security_group.runtime.id]
   }
-  client_authentication { sasl { iam { enabled = true } } }
+  client_authentication {
+    sasl {
+      iam {
+        enabled = true
+      }
+    }
+  }
 }
 
 resource "aws_emrserverless_application" "spark" {
@@ -217,6 +229,39 @@ resource "aws_ecr_repository" "images" {
   name                 = "${local.name}/${each.key}"
   image_tag_mutability = "IMMUTABLE"
   image_scanning_configuration { scan_on_push = true }
+}
+
+resource "aws_efs_file_system" "models" {
+  encrypted = true
+  tags      = { Name = "${local.name}-models" }
+}
+
+resource "aws_efs_backup_policy" "models" {
+  file_system_id = aws_efs_file_system.models.id
+  backup_policy { status = "ENABLED" }
+}
+
+resource "aws_efs_access_point" "models" {
+  file_system_id = aws_efs_file_system.models.id
+  posix_user {
+    uid = 10001
+    gid = 10001
+  }
+  root_directory {
+    path = "/models"
+    creation_info {
+      owner_uid   = 10001
+      owner_gid   = 10001
+      permissions = "0750"
+    }
+  }
+}
+
+resource "aws_efs_mount_target" "models" {
+  count           = 2
+  file_system_id  = aws_efs_file_system.models.id
+  subnet_id       = aws_subnet.data[count.index].id
+  security_groups = [aws_security_group.runtime.id]
 }
 
 resource "aws_ecs_cluster" "main" {
@@ -250,7 +295,10 @@ resource "aws_iam_role_policy" "ecs_secrets" {
   role = aws_iam_role.ecs_execution.id
   policy = jsonencode({
     Version = "2012-10-17", Statement = [{
-      Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [aws_secretsmanager_secret.database_url.arn]
+      Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = concat(
+        [aws_secretsmanager_secret.database_url.arn],
+        var.entsoe_token_secret_arn == "" ? [] : [var.entsoe_token_secret_arn]
+      )
     }]
   })
 }
@@ -283,17 +331,34 @@ resource "aws_ecs_task_definition" "api" {
   memory                   = 1024
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
+  volume {
+    name = "models"
+    efs_volume_configuration {
+      file_system_id     = aws_efs_file_system.models.id
+      transit_encryption = "ENABLED"
+      root_directory     = "/"
+      authorization_config {
+        access_point_id = aws_efs_access_point.models.id
+        iam             = "DISABLED"
+      }
+    }
+  }
   container_definitions = jsonencode([{
-    name = "api", image = var.api_image, essential = true,
+    name         = "api", image = var.api_image, essential = true,
     portMappings = [{ containerPort = 8000, protocol = "tcp" }],
-    secrets = [{ name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.database_url.arn}:DATABASE_URL::" }],
+    secrets = concat(
+      [{ name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.database_url.arn}:DATABASE_URL::" }],
+      var.entsoe_token_secret_arn == "" ? [] : [{ name = "ENTSOE_TOKEN", valueFrom = var.entsoe_token_secret_arn }]
+    ),
     environment = [
       { name = "APP_ENV", value = var.environment },
+      { name = "MODEL_ARTIFACT_ROOT", value = "/models" },
       { name = "ICEBERG_WAREHOUSE", value = "s3://${aws_s3_bucket.lakehouse.id}/warehouse" },
       { name = "KAFKA_BOOTSTRAP_SERVERS", value = aws_msk_serverless_cluster.main.bootstrap_brokers_sasl_iam }
     ],
+    mountPoints      = [{ sourceVolume = "models", containerPath = "/models", readOnly = false }],
     logConfiguration = { logDriver = "awslogs", options = { awslogs-group = aws_cloudwatch_log_group.api.name, awslogs-region = var.aws_region, awslogs-stream-prefix = "api" } },
-    healthCheck = { command = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')\""], interval = 30, timeout = 5, retries = 3, startPeriod = 30 }
+    healthCheck      = { command = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')\""], interval = 30, timeout = 5, retries = 3, startPeriod = 30 }
   }])
 }
 
@@ -347,7 +412,7 @@ resource "aws_ecs_service" "api" {
     container_name   = "api"
     container_port   = 8000
   }
-  depends_on = [aws_lb_listener.https]
+  depends_on = [aws_lb_listener.https, aws_efs_mount_target.models]
 }
 
 resource "aws_iam_role" "scheduler" {
@@ -363,7 +428,7 @@ resource "aws_iam_role_policy" "scheduler" {
   role = aws_iam_role.scheduler.id
   policy = jsonencode({
     Version = "2012-10-17", Statement = [
-      { Effect = "Allow", Action = ["ecs:RunTask"], Resource = local.runtime_enabled ? [aws_ecs_task_definition.api[0].arn] : ["*"] },
+      { Effect = "Allow", Action = ["ecs:RunTask"], Resource = local.runtime_enabled ? ["${local.task_definition_family_arn}:*"] : ["*"] },
       { Effect = "Allow", Action = ["iam:PassRole"], Resource = [aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn] }
     ]
   })
@@ -374,7 +439,7 @@ resource "aws_scheduler_schedule_group" "forecasting" {
 }
 
 resource "aws_scheduler_schedule" "demand" {
-  count               = local.runtime_enabled ? 1 : 0
+  count               = local.runtime_enabled && var.entsoe_token_secret_arn != "" ? 1 : 0
   name                = "${local.name}-demand-quarter-hour"
   group_name          = aws_scheduler_schedule_group.forecasting.name
   schedule_expression = "rate(15 minutes)"
@@ -383,10 +448,10 @@ resource "aws_scheduler_schedule" "demand" {
     arn      = aws_ecs_cluster.main.arn
     role_arn = aws_iam_role.scheduler.arn
     input = jsonencode({
-      containerOverrides = [{ name = "api", command = ["energy-grid", "materialize", "--target", "demand"] }]
+      containerOverrides = [{ name = "api", command = ["energy-grid", "live-inference", "--target", "demand"] }]
     })
     ecs_parameters {
-      task_definition_arn = aws_ecs_task_definition.api[0].arn
+      task_definition_arn = local.task_definition_family_arn
       launch_type         = "FARGATE"
       network_configuration {
         subnets          = aws_subnet.public[*].id
@@ -398,7 +463,7 @@ resource "aws_scheduler_schedule" "demand" {
 }
 
 resource "aws_scheduler_schedule" "price" {
-  count                        = local.runtime_enabled ? 1 : 0
+  count                        = local.runtime_enabled && var.entsoe_token_secret_arn != "" ? 1 : 0
   name                         = "${local.name}-price-day-ahead"
   group_name                   = aws_scheduler_schedule_group.forecasting.name
   schedule_expression          = "cron(0 10 * * ? *)"
@@ -408,10 +473,38 @@ resource "aws_scheduler_schedule" "price" {
     arn      = aws_ecs_cluster.main.arn
     role_arn = aws_iam_role.scheduler.arn
     input = jsonencode({
-      containerOverrides = [{ name = "api", command = ["energy-grid", "materialize", "--target", "price"] }]
+      containerOverrides = [{ name = "api", command = ["energy-grid", "live-inference", "--target", "price"] }]
     })
     ecs_parameters {
-      task_definition_arn = aws_ecs_task_definition.api[0].arn
+      task_definition_arn = local.task_definition_family_arn
+      launch_type         = "FARGATE"
+      network_configuration {
+        subnets          = aws_subnet.public[*].id
+        security_groups  = [aws_security_group.runtime.id]
+        assign_public_ip = true
+      }
+    }
+  }
+}
+
+resource "aws_scheduler_schedule" "candidate_training" {
+  count                        = local.runtime_enabled && var.entsoe_token_secret_arn != "" ? 1 : 0
+  name                         = "${local.name}-candidate-training"
+  group_name                   = aws_scheduler_schedule_group.forecasting.name
+  schedule_expression          = "cron(0 3 ? * SUN *)"
+  schedule_expression_timezone = "Europe/Madrid"
+  flexible_time_window { mode = "OFF" }
+  target {
+    arn      = aws_ecs_cluster.main.arn
+    role_arn = aws_iam_role.scheduler.arn
+    input = jsonencode({
+      containerOverrides = [{
+        name    = "api"
+        command = ["energy-grid", "live-demo", "--no-publish-kafka", "--no-register-mlflow"]
+      }]
+    })
+    ecs_parameters {
+      task_definition_arn = local.task_definition_family_arn
       launch_type         = "FARGATE"
       network_configuration {
         subnets          = aws_subnet.public[*].id
@@ -432,7 +525,7 @@ resource "aws_iam_role" "github_deploy" {
   name = "${local.name}-github-deploy"
   assume_role_policy = jsonencode({
     Version = "2012-10-17", Statement = [{
-      Effect = "Allow", Principal = { Federated = aws_iam_openid_connect_provider.github.arn }, Action = "sts:AssumeRoleWithWebIdentity",
+      Effect    = "Allow", Principal = { Federated = aws_iam_openid_connect_provider.github.arn }, Action = "sts:AssumeRoleWithWebIdentity",
       Condition = { StringEquals = { "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" }, StringLike = { "token.actions.githubusercontent.com:sub" = "repo:${var.github_repository}:*" } }
     }]
   })
@@ -442,7 +535,7 @@ resource "aws_iam_role_policy" "github_deploy" {
   role = aws_iam_role.github_deploy.id
   policy = jsonencode({
     Version = "2012-10-17", Statement = [{
-      Effect = "Allow", Action = ["ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart", "ecs:DescribeServices", "ecs:UpdateService"], Resource = "*"
+      Effect = "Allow", Action = ["ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart", "ecs:DescribeServices", "ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition", "ecs:UpdateService", "iam:PassRole"], Resource = "*"
     }]
   })
 }

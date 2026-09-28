@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "energy-grid-intelligence"
 version = "0.1.0"
-description = "Real-time energy grid intelligence platform for the Spanish electricity market"
+description = "European electricity data ingestion, forecasting, evaluation, and serving"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -16,6 +16,8 @@ dependencies = [
   "mlflow==3.15.1",
   "numpy>=1.26,<3",
   "pandas>=2.2,<3",
+  "pyarrow>=18,<24",
+  "joblib>=1.4,<2",
   "prometheus-client>=0.21,<1",
   "psycopg[binary]>=3.2,<4",
   "pydantic>=2.9,<3",
@@ -24,11 +26,19 @@ dependencies = [
   "sqlalchemy>=2.0,<3",
   "statsmodels>=0.14,<1",
   "typer>=0.12,<1",
+  "tzdata>=2024.1",
   "uvicorn[standard]>=0.32,<1",
 ]
 
 [project.optional-dependencies]
 streaming = ["confluent-kafka>=2.6,<3", "pyspark==3.5.5"]
+demo = [
+  "gradio>=5,<7",
+  "plotly>=5,<7",
+  "xgboost>=2,<4",
+  "catboost>=1.2,<2",
+  "huggingface-hub>=0.30,<2",
+]
 dev = [
   "mypy>=1.13,<2",
   "pytest>=8.3,<9",
@@ -60,5 +70,5 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["confluent_kafka.*", "pandas.*", "statsmodels.*", "pyspark.*", "pyarrow.*", "joblib.*", "lightgbm.*", "plotly.*", "gradio.*", "xgboost.*", "catboost.*", "sklearn.*"]
+module = ["confluent_kafka.*", "pandas.*", "statsmodels.*", "pyspark.*", "pyarrow.*", "joblib.*", "lightgbm.*", "plotly.*", "gradio.*", "xgboost.*", "catboost.*", "sklearn.*", "huggingface_hub.*"]
 ignore_missing_imports = true

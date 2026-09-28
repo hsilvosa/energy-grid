@@ -52,3 +52,8 @@ variable "alert_email" {
   default     = ""
 }
 
+variable "entsoe_token_secret_arn" {
+  description = "Secrets Manager ARN containing the ENTSOE_TOKEN value for scheduled jobs."
+  type        = string
+  default     = ""
+}

@@ -31,5 +31,28 @@ jobs:
           context: .
           push: true
           tags: ${{ vars.API_ECR_REPOSITORY }}:${{ github.sha }}
-      - run: aws ecs update-service --cluster "${{ vars.ECS_CLUSTER }}" --service "${{ vars.ECS_SERVICE }}" --force-new-deployment
-
+      - name: Register immutable task definition
+        id: task-definition
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          IMAGE_URI: ${{ vars.API_ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          TASK_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$TASK_ARN" --query taskDefinition > current-task.json
+          jq --arg IMAGE "$IMAGE_URI" '(.containerDefinitions[] | select(.name == "api") | .image) = $IMAGE | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' current-task.json > next-task.json
+          NEXT_TASK_ARN=$(aws ecs register-task-definition --cli-input-json file://next-task.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_arn=$NEXT_TASK_ARN" >> "$GITHUB_OUTPUT"
+      - name: Deploy and wait for stability
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          TASK_ARN: ${{ steps.task-definition.outputs.task_arn }}
+        run: |
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$TASK_ARN"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+      - name: Smoke test
+        if: ${{ vars.API_HEALTHCHECK_URL != '' }}
+        env:
+          API_HEALTHCHECK_URL: ${{ vars.API_HEALTHCHECK_URL }}
+        run: curl --fail --retry 5 --retry-delay 5 "$API_HEALTHCHECK_URL/health/ready"

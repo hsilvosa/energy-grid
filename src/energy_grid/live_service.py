@@ -4,9 +4,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 
 from energy_grid.config import Settings
-from energy_grid.domain import EventType, GridEvent
+from energy_grid.domain import EventType, ForecastRecord, GridEvent
 from energy_grid.live_pipeline import TrainingResult, log_training_result, train_and_forecast
 from energy_grid.monitoring import EVENTS_PUBLISHED
+from energy_grid.release import (
+    ReleaseDecision,
+    evaluate_and_record_candidate,
+    forecast_with_approved_model,
+)
 from energy_grid.replay import TOPICS, KafkaProducerAdapter
 from energy_grid.sources.entsoe import EntsoeClient
 from energy_grid.sources.open_meteo import OpenMeteoClient
@@ -23,6 +28,15 @@ class LiveRunSummary:
     demand_result: TrainingResult
     price_result: TrainingResult
     mlflow_run_ids: dict[str, str]
+    releases: dict[str, ReleaseDecision]
+
+
+@dataclass(frozen=True)
+class LiveInferenceSummary:
+    demand_events: int
+    price_events: int
+    weather_events: int
+    forecasts_written: int
 
 
 def _publish(events: list[GridEvent], producer: KafkaProducerAdapter) -> int:
@@ -46,8 +60,8 @@ def run_live_pipeline(
         raise ValueError("ENTSOE_TOKEN is missing; add it to .env")
     if history_days < 15:
         raise ValueError("history_days must be at least 15 to construct seven-day lags")
-    current = (now or datetime.now(UTC)).astimezone(UTC)
-    history_end = datetime.combine(current.date(), time.min, UTC)
+    reference_time = (now or datetime.now(UTC)).astimezone(UTC)
+    history_end = datetime.combine(reference_time.date(), time.min, UTC)
     history_start = history_end - timedelta(days=history_days)
     generation_start = history_end - timedelta(days=min(generation_days, history_days))
 
@@ -62,6 +76,7 @@ def run_live_pipeline(
         historical=True,
     )
     live_weather = weather.events(historical=False)
+    current = (now or datetime.now(UTC)).astimezone(UTC)
 
     demand_result = train_and_forecast(
         demand_events,
@@ -80,19 +95,13 @@ def run_live_pipeline(
 
     store = ForecastStore(settings.database_url)
     store.create_schema()
-    store.upsert_forecasts(demand_result.forecasts + price_result.forecasts)
+    releases: dict[str, ReleaseDecision] = {}
     for result in (demand_result, price_result):
-        store.set_model_status(
-            result.target,
-            champion_version=result.model.model_version,
-            previous_version=None,
-            baseline_version="seasonal-persistence-7d",
-            last_evaluated_at=current,
-            rolling_error=result.metrics.mae,
-            baseline_error=result.baseline_mae,
-            consecutive_breaches=0,
-            status="live",
+        decision = evaluate_and_record_candidate(
+            store, result, settings.model_artifact_root
         )
+        releases[result.target.value] = decision
+        store.upsert_forecasts(decision.forecasts)
 
     kafka_count = 0
     if publish_kafka:
@@ -123,4 +132,53 @@ def run_live_pipeline(
         demand_result=demand_result,
         price_result=price_result,
         mlflow_run_ids=mlflow_runs,
+        releases=releases,
+    )
+
+
+def run_live_inference(
+    settings: Settings,
+    *,
+    history_days: int = 15,
+    targets: tuple[EventType, ...] = (EventType.DEMAND, EventType.PRICE),
+    now: datetime | None = None,
+) -> LiveInferenceSummary:
+    """Fetch current inputs and forecast using approved artifacts only."""
+    if not settings.entsoe_token:
+        raise ValueError("ENTSOE_TOKEN is missing; add it to the runtime secret store")
+    reference_time = (now or datetime.now(UTC)).astimezone(UTC)
+    history_end = datetime.combine(reference_time.date(), time.min, UTC)
+    history_start = history_end - timedelta(days=history_days)
+    entsoe = EntsoeClient(settings.entsoe_token, timeout=90)
+    weather = OpenMeteoClient(timeout=90)
+    demand_events = (
+        entsoe.events(EventType.DEMAND, history_start, history_end)
+        if EventType.DEMAND in targets else []
+    )
+    price_events = (
+        entsoe.events(EventType.PRICE, history_start, history_end)
+        if EventType.PRICE in targets else []
+    )
+    live_weather = weather.events(historical=False)
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    store = ForecastStore(settings.database_url)
+    store.create_schema()
+    forecasts: list[ForecastRecord] = []
+    for target, events in (
+        (EventType.DEMAND, demand_events),
+        (EventType.PRICE, price_events),
+    ):
+        if target not in targets:
+            continue
+        forecasts.extend(
+            forecast_with_approved_model(
+                store, events, live_weather, target, issue_time=current
+            )
+        )
+    store.upsert_forecasts(forecasts)
+    return LiveInferenceSummary(
+        demand_events=len(demand_events),
+        price_events=len(price_events),
+        weather_events=len(live_weather),
+        forecasts_written=len(forecasts),
     )

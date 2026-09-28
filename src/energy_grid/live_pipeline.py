@@ -61,19 +61,29 @@ def events_to_series(events: list[GridEvent], target: EventType) -> pd.Series:
     return series.astype(float)
 
 
-def weather_to_frame(events: list[GridEvent]) -> pd.DataFrame:
-    rows: list[tuple[datetime, str, float]] = []
+def weather_to_frame(
+    events: list[GridEvent], *, available_at: datetime | None = None
+) -> pd.DataFrame:
+    rows: list[tuple[datetime, str, float, int, datetime]] = []
     for event in events:
         if event.event_type != EventType.WEATHER or event.value is None or not event.dimension:
             continue
         cursor = event.interval_start.astimezone(UTC)
         end = event.interval_end.astimezone(UTC)
         while cursor < end:
-            rows.append((cursor, event.dimension, float(event.value)))
+            cutoff = available_at.astimezone(UTC) if available_at else None
+            if cutoff is None or event.published_at <= cutoff:
+                rows.append(
+                    (cursor, event.dimension, float(event.value), event.revision, event.ingested_at)
+                )
             cursor += timedelta(minutes=15)
     if not rows:
         raise ValueError("no usable weather events were downloaded")
-    frame = pd.DataFrame(rows, columns=["timestamp", "dimension", "value"])
+    frame = pd.DataFrame(
+        rows, columns=["timestamp", "dimension", "value", "revision", "ingested_at"]
+    )
+    frame = frame.sort_values(["timestamp", "dimension", "revision", "ingested_at"])
+    frame = frame.drop_duplicates(["timestamp", "dimension"], keep="last")
     result = frame.pivot_table(index="timestamp", columns="dimension", values="value")
     result.index = pd.DatetimeIndex(result.index).tz_convert("UTC")
     return result.sort_index()
@@ -107,7 +117,7 @@ def build_training_frame(
     for column in weather_columns:
         if column not in frame:
             frame[column] = np.nan
-    frame[weather_columns] = frame[weather_columns].interpolate(limit_direction="both")
+    frame[weather_columns] = frame[weather_columns].ffill(limit=4)
     frame = _calendar(frame)
     frame["lag_96"] = frame["target"].shift(96)
     frame["lag_672"] = frame["target"].shift(672)
@@ -127,10 +137,15 @@ def build_future_frame(
     intervals: list[tuple[datetime, datetime]],
     target_history: pd.Series,
     live_weather_events: list[GridEvent],
+    *,
+    available_at: datetime | None = None,
 ) -> pd.DataFrame:
-    weather = weather_to_frame(live_weather_events)
+    weather = weather_to_frame(
+        live_weather_events,
+        available_at=available_at or intervals[0][0],
+    )
     index = pd.DatetimeIndex([start for start, _ in intervals]).tz_convert("UTC")
-    expanded_weather = weather.reindex(weather.index.union(index)).sort_index().ffill().bfill()
+    expanded_weather = weather.reindex(weather.index.union(index)).sort_index().ffill(limit=4)
     frame = expanded_weather.reindex(index)
     for column in (
         "temperature_2m",
@@ -138,9 +153,8 @@ def build_future_frame(
         "relative_humidity_2m",
         "shortwave_radiation",
     ):
-        if column not in frame:
-            frame[column] = 0.0
-        frame[column] = frame[column].fillna(float(weather[column].median()))
+        if column not in frame or frame[column].isna().any():
+            raise ValueError(f"live weather does not cover every forecast interval: {column}")
     frame = _calendar(frame)
     recent_mean = float(target_history.tail(96).mean())
     frame["lag_96"] = [
@@ -170,12 +184,13 @@ def source_snapshot_id(*event_groups: list[GridEvent]) -> str:
 
 def _forecast_intervals(target: EventType, issue_time: datetime) -> list[tuple[datetime, datetime]]:
     if target == EventType.DEMAND:
+        first_start = floor_quarter_hour(issue_time) + timedelta(minutes=15)
         return [
             (
-                issue_time + timedelta(minutes=15 * step),
-                issue_time + timedelta(minutes=15 * (step + 1)),
+                first_start + timedelta(minutes=15 * step),
+                first_start + timedelta(minutes=15 * (step + 1)),
             )
-            for step in range(1, 25)
+            for step in range(24)
         ]
     delivery_date = issue_time.astimezone(MADRID).date() + timedelta(days=1)
     return delivery_intervals(delivery_date)
@@ -216,10 +231,12 @@ def train_and_forecast(
     baseline_mae = float(np.mean(np.abs(holdout["target"].to_numpy() - baseline)))
 
     model = LightGBMQuantileForecaster().fit(frame, frame["target"], feature_names=LIVE_FEATURES)
-    issue = floor_quarter_hour(issue_time or datetime.now(UTC))
+    issue = (issue_time or datetime.now(UTC)).astimezone(UTC)
     intervals = _forecast_intervals(target, issue)
     target_history = events_to_series(target_events, target)
-    future = build_future_frame(intervals, target_history, live_weather)
+    future = build_future_frame(
+        intervals, target_history, live_weather, available_at=issue
+    )
     p10, p50, p90 = model.predict(future)
     snapshot_id = source_snapshot_id(target_events, historical_weather, live_weather)
     unit = "MW" if target == EventType.DEMAND else "EUR/MWh"

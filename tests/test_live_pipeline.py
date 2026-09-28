@@ -1,7 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
 from energy_grid.domain import EventType, GridEvent
-from energy_grid.live_pipeline import build_training_frame, events_to_series, source_snapshot_id
+from energy_grid.live_pipeline import (
+    build_training_frame,
+    events_to_series,
+    source_snapshot_id,
+    weather_to_frame,
+)
 
 
 def grid_event(
@@ -108,3 +113,18 @@ def test_snapshot_is_stable_and_identifies_real_inputs() -> None:
     second = [grid_event(EventType.PRICE, start, 2.0, checksum="b")]
     assert source_snapshot_id(first, second) == source_snapshot_id(second, first)
     assert source_snapshot_id(first, second).startswith("live-")
+
+
+def test_live_weather_excludes_revisions_published_after_cutoff() -> None:
+    start = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    original = grid_event(
+        EventType.WEATHER, start + timedelta(hours=1), 10.0,
+        minutes=60, dimension="temperature_2m",
+    ).model_copy(update={"published_at": start - timedelta(minutes=5)})
+    future_revision = original.model_copy(update={
+        "revision": 2,
+        "value": 99.0,
+        "published_at": start + timedelta(minutes=5),
+    })
+    frame = weather_to_frame([original, future_revision], available_at=start)
+    assert frame.iloc[0]["temperature_2m"] == 10.0
